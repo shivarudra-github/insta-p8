@@ -48,6 +48,28 @@ export async function GET(request: NextRequest) {
   const mode = searchParams.get("hub.mode")
   const token = searchParams.get("hub.verify_token")
   const challenge = searchParams.get("hub.challenge")
+
+  // ── TEMPORARY DIAGNOSTIC ── remove after root-cause is identified ──────────
+  // Activated ONLY when debug=1 + hub.mode=subscribe + hub.verify_token=TEST123 + hub.challenge=123456
+  if (
+    searchParams.get("debug") === "1" &&
+    mode === "subscribe" &&
+    token === "TEST123" &&
+    challenge === "123456"
+  ) {
+    return NextResponse.json({
+      diagnostic: "webhook-verify-v1",
+      mode,
+      hasExpectedToken: Boolean(WEBHOOK_VERIFY_TOKEN),
+      hasReceivedToken: Boolean(token),
+      expectedTokenHasOuterWhitespace: Boolean(
+        WEBHOOK_VERIFY_TOKEN && WEBHOOK_VERIFY_TOKEN !== WEBHOOK_VERIFY_TOKEN.trim()
+      ),
+      challengePresent: Boolean(challenge),
+    })
+  }
+  // ── END TEMPORARY DIAGNOSTIC ────────────────────────────────────────────────
+
 console.info("[webhook verify diagnostic]", {
   mode,
   hasExpectedToken: Boolean(WEBHOOK_VERIFY_TOKEN),
