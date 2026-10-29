@@ -1,45 +1,56 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { getSupabaseServerClient } from "@/lib/supabase-server"
+import { authenticateRequest } from "@/lib/auth-session"
 
 export async function GET(request: NextRequest) {
   try {
-    const userId = request.nextUrl.searchParams.get("userId")
-    if (!userId) return NextResponse.json({ error: "Missing userId" }, { status: 400 })
+    const auth = await authenticateRequest(request)
+    if (auth.errorResponse) return auth.errorResponse
+
+    const requestedUserId = request.nextUrl.searchParams.get("userId")
+    if (requestedUserId && requestedUserId !== auth.session.userId) {
+      return NextResponse.json({ error: "Forbidden: Cannot access another user's automations" }, { status: 403 })
+    }
 
     const supabase = await getSupabaseServerClient()
 
-    // STABLE FIX: Fetch rules by the Login ID (userId) directly.
-    // We stop caring about the shifting Business ID here.
     const { data, error } = await supabase
       .from("automations")
       .select("*")
-      .eq("user_id", userId)
+      .eq("user_id", auth.session.userId)
       .order("created_at", { ascending: false })
 
     if (error) throw error
     return NextResponse.json(data)
   } catch (error) {
-    console.error("[v0] Automations GET error:", error)
-    return NextResponse.json({ error: "Failed to fetch" }, { status: 500 })
+    console.error("[Automations] GET error:", error)
+    return NextResponse.json({ error: "Failed to fetch automations" }, { status: 500 })
   }
 }
 
 export async function POST(request: NextRequest) {
   try {
-    const { userId, name, trigger_source, trigger_type, trigger_value, content, specific_media_id } = await request.json()
+    const auth = await authenticateRequest(request)
+    if (auth.errorResponse) return auth.errorResponse
 
-    if (!userId || !name || !trigger_value || !content || !trigger_source) {
-      return NextResponse.json({ error: "Missing fields" }, { status: 400 })
+    const body = await request.json()
+    const { userId, name, trigger_source, trigger_type, trigger_value, content, specific_media_id } = body
+
+    if (userId && userId !== auth.session.userId) {
+      return NextResponse.json({ error: "Forbidden: Cannot create automations for another user" }, { status: 403 })
+    }
+
+    if (!name || !trigger_value || !content || !trigger_source) {
+      return NextResponse.json({ error: "Missing required fields" }, { status: 400 })
     }
 
     // Validate trigger_source
-    if (!['comment', 'dm', 'story'].includes(trigger_source)) {
+    if (!["comment", "dm", "story"].includes(trigger_source)) {
       return NextResponse.json({ error: "Invalid trigger source" }, { status: 400 })
     }
 
     const supabase = await getSupabaseServerClient()
 
-    // STABLE FIX: Always save to the Login ID
     const finalTriggerValue =
       trigger_type === "postback"
         ? `PAYLOAD_${Date.now()}_${Math.random().toString(36).substring(7)}`
@@ -48,7 +59,7 @@ export async function POST(request: NextRequest) {
     const { data, error } = await supabase
       .from("automations")
       .insert({
-        user_id: userId,
+        user_id: auth.session.userId,
         name,
         trigger_source,
         trigger_type: trigger_type || "keyword",
@@ -64,41 +75,63 @@ export async function POST(request: NextRequest) {
     if (error) throw error
     return NextResponse.json(data)
   } catch (error) {
-    console.error("[v0] Automations POST error:", error)
-    return NextResponse.json({ error: "Failed to create" }, { status: 500 })
+    console.error("[Automations] POST error:", error)
+    return NextResponse.json({ error: "Failed to create automation" }, { status: 500 })
   }
 }
 
 export async function DELETE(request: NextRequest) {
   try {
+    const auth = await authenticateRequest(request)
+    if (auth.errorResponse) return auth.errorResponse
+
     const id = request.nextUrl.searchParams.get("id")
     if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 })
+
     const supabase = await getSupabaseServerClient()
-    const { error } = await supabase.from("automations").delete().eq("id", id)
+
+    // Strictly enforce ownership on delete
+    const { error, count } = await supabase
+      .from("automations")
+      .delete({ count: "exact" })
+      .eq("id", id)
+      .eq("user_id", auth.session.userId)
+
     if (error) throw error
+    if (count === 0) {
+      return NextResponse.json({ error: "Automation not found or not owned by user" }, { status: 404 })
+    }
+
     return NextResponse.json({ success: true })
   } catch (error) {
-    console.error("[v0] Automations DELETE error:", error)
-    return NextResponse.json({ error: "Failed to delete" }, { status: 500 })
+    console.error("[Automations] DELETE error:", error)
+    return NextResponse.json({ error: "Failed to delete automation" }, { status: 500 })
   }
 }
 
 export async function PUT(request: NextRequest) {
   try {
-    const { id, name, trigger_source, trigger_type, trigger_value, content, specific_media_id } = await request.json()
+    const auth = await authenticateRequest(request)
+    if (auth.errorResponse) return auth.errorResponse
 
-    if (!id || !name || !trigger_value || !content) {
-      return NextResponse.json({ error: "Missing fields" }, { status: 400 })
+    const body = await request.json()
+    const { id, name, trigger_source, trigger_type, trigger_value, content, specific_media_id, userId } = body
+
+    if (userId && userId !== auth.session.userId) {
+      return NextResponse.json({ error: "Forbidden: Cannot update automations for another user" }, { status: 403 })
     }
 
-    // Validate trigger_source if provided
-    if (trigger_source && !['comment', 'dm', 'story'].includes(trigger_source)) {
+    if (!id || !name || !trigger_value || !content) {
+      return NextResponse.json({ error: "Missing required fields" }, { status: 400 })
+    }
+
+    if (trigger_source && !["comment", "dm", "story"].includes(trigger_source)) {
       return NextResponse.json({ error: "Invalid trigger source" }, { status: 400 })
     }
 
     const supabase = await getSupabaseServerClient()
 
-    const updateData: any = {
+    const updateData: Record<string, unknown> = {
       name,
       trigger_type: trigger_type || "keyword",
       trigger_value: trigger_value.toLowerCase(),
@@ -106,28 +139,36 @@ export async function PUT(request: NextRequest) {
       specific_media_id: specific_media_id || null,
     }
 
-    // Only update trigger_source if provided
     if (trigger_source) {
       updateData.trigger_source = trigger_source
     }
 
+    // Strictly enforce ownership on update
     const { data, error } = await supabase
       .from("automations")
       .update(updateData)
       .eq("id", id)
+      .eq("user_id", auth.session.userId)
       .select()
       .single()
 
     if (error) throw error
+    if (!data) {
+      return NextResponse.json({ error: "Automation not found or not owned by user" }, { status: 404 })
+    }
+
     return NextResponse.json(data)
   } catch (error) {
-    console.error("[v0] Automations PUT error:", error)
-    return NextResponse.json({ error: "Failed to update" }, { status: 500 })
+    console.error("[Automations] PUT error:", error)
+    return NextResponse.json({ error: "Failed to update automation" }, { status: 500 })
   }
 }
 
 export async function PATCH(request: NextRequest) {
   try {
+    const auth = await authenticateRequest(request)
+    if (auth.errorResponse) return auth.errorResponse
+
     const { id, is_active, action } = await request.json()
     if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 })
 
@@ -138,15 +179,25 @@ export async function PATCH(request: NextRequest) {
         .from("automations")
         .select("*")
         .eq("id", id)
+        .eq("user_id", auth.session.userId)
         .single()
-      if (fetchError || !original) return NextResponse.json({ error: "Not found" }, { status: 404 })
+
+      if (fetchError || !original) {
+        return NextResponse.json({ error: "Automation not found or not owned by user" }, { status: 404 })
+      }
 
       const { id: _id, created_at, updated_at, ...rest } = original
       const { data, error } = await supabase
         .from("automations")
-        .insert({ ...rest, name: `${original.name} (copy)`, is_active: false })
+        .insert({
+          ...rest,
+          user_id: auth.session.userId,
+          name: `${original.name} (copy)`,
+          is_active: false,
+        })
         .select()
         .single()
+
       if (error) throw error
       return NextResponse.json(data)
     }
@@ -159,13 +210,18 @@ export async function PATCH(request: NextRequest) {
       .from("automations")
       .update({ is_active })
       .eq("id", id)
+      .eq("user_id", auth.session.userId)
       .select()
       .single()
 
     if (error) throw error
+    if (!data) {
+      return NextResponse.json({ error: "Automation not found or not owned by user" }, { status: 404 })
+    }
+
     return NextResponse.json(data)
   } catch (error) {
-    console.error("[v0] Automations PATCH error:", error)
-    return NextResponse.json({ error: "Failed to update" }, { status: 500 })
+    console.error("[Automations] PATCH error:", error)
+    return NextResponse.json({ error: "Failed to update automation status" }, { status: 500 })
   }
 }

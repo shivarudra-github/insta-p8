@@ -1,42 +1,87 @@
+import crypto from "crypto"
 import { type NextRequest, NextResponse } from "next/server"
 import { getSupabaseServerClient } from "@/lib/supabase-server"
+import { SESSION_COOKIE_NAME, createSessionToken, getSessionCookieOptions } from "@/lib/session"
 
 export async function GET(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams
   const code = searchParams.get("code")
+  const state = searchParams.get("state")
   const error = searchParams.get("error")
+  const errorDescription = searchParams.get("error_description")
 
+  const isProd = process.env.NODE_ENV === "production"
+
+  // Helper to clear oauth_state cookie on error redirects
+  const clearStateCookie = (res: NextResponse) => {
+    res.cookies.set("oauth_state", "", {
+      path: "/",
+      maxAge: 0,
+      httpOnly: true,
+      secure: isProd,
+      sameSite: "lax",
+    })
+  }
+
+  // 1. Handle Meta OAuth Error Responses
   if (error) {
+    console.warn("[oauth/callback] Meta returned error:", error, errorDescription)
     const redirectUrl = new URL("/", request.url)
-    redirectUrl.searchParams.set("error", error)
-    return NextResponse.redirect(redirectUrl)
+    redirectUrl.searchParams.set("error", errorDescription || error)
+    const res = NextResponse.redirect(redirectUrl, {
+      status: 302,
+      headers: { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+    })
+    clearStateCookie(res)
+    return res
   }
 
-  if (code) {
+  // 2. Validate OAuth CSRF State Nonce Defensively
+  const storedState = request.cookies.get("oauth_state")?.value
+  const incomingBuf = Buffer.from(state || "", "utf8")
+  const storedBuf = Buffer.from(storedState || "", "utf8")
+
+  const isStateValid =
+    incomingBuf.length > 0 &&
+    incomingBuf.length === storedBuf.length &&
+    crypto.timingSafeEqual(incomingBuf, storedBuf)
+
+  if (!isStateValid) {
+    console.warn("[oauth/callback] Potential CSRF or expired state nonce. Verification failed.")
     const redirectUrl = new URL("/", request.url)
-    redirectUrl.searchParams.set("code", code)
-    return NextResponse.redirect(redirectUrl)
+    redirectUrl.searchParams.set("error", "invalid_oauth_state")
+    const res = NextResponse.redirect(redirectUrl, {
+      status: 302,
+      headers: { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+    })
+    clearStateCookie(res)
+    return res
   }
 
-  return NextResponse.json({ error: "Invalid callback" }, { status: 400 })
-}
+  // 3. Ensure Authorization Code is Present
+  if (!code) {
+    console.warn("[oauth/callback] Missing authorization code")
+    const redirectUrl = new URL("/", request.url)
+    redirectUrl.searchParams.set("error", "missing_code")
+    const res = NextResponse.redirect(redirectUrl, {
+      status: 302,
+      headers: { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+    })
+    clearStateCookie(res)
+    return res
+  }
 
-export async function POST(request: NextRequest) {
   try {
-    const body = await request.json()
-    const { code } = body
-    if (!code) return NextResponse.json({ error: "No code" }, { status: 400 })
-
-    // 1. Env Vars
-    const clientId = process.env.INSTAGRAM_APP_ID
+    // 4. Validate Server Environment Configuration
+    const clientId = process.env.INSTAGRAM_APP_ID || process.env.NEXT_PUBLIC_INSTAGRAM_APP_ID
     const clientSecret = process.env.INSTAGRAM_APP_SECRET
     const redirectUri = process.env.NEXT_PUBLIC_INSTAGRAM_REDIRECT_URI
 
     if (!clientId || !clientSecret || !redirectUri) {
-      throw new Error("Missing Env Vars: Check INSTAGRAM_APP_ID")
+      throw new Error("Missing required OAuth environment variables")
     }
 
-    // 2. Exchange Code for Short Token
+    // 5. Exchange Authorization Code for Short-Lived Access Token
     const tokenParams = new URLSearchParams({
       client_id: clientId,
       client_secret: clientSecret,
@@ -53,80 +98,113 @@ export async function POST(request: NextRequest) {
 
     const tokenData = await tokenRes.json()
     if (!tokenRes.ok) {
-      if (tokenData.error_message?.includes("authorization code has been used")) {
-        // Harmless double-fire from React StrictMode or double clicks
-        return NextResponse.json({ error: "Code already used" }, { status: 400 })
-      }
-      console.error("[v0] 🔴 Token Error:", JSON.stringify(tokenData, null, 2))
-      return NextResponse.json({ error: tokenData.error_description || "Token failed" }, { status: 400 })
+      console.error("[oauth/callback] Token exchange failed:", tokenData.error_message || tokenData)
+      const redirectUrl = new URL("/", request.url)
+      redirectUrl.searchParams.set("error", "token_exchange_failed")
+      const res = NextResponse.redirect(redirectUrl, {
+        status: 302,
+        headers: { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+      })
+      clearStateCookie(res)
+      return res
     }
 
     const shortToken = tokenData.access_token
     const loginUserId = tokenData.user_id.toString()
 
-    // 3. Exchange for Long Token (60 Days)
+    // 6. Exchange for Long-Lived Token (60 Days)
     const longLivedUrl = `https://graph.instagram.com/access_token?grant_type=ig_exchange_token&client_secret=${clientSecret}&access_token=${shortToken}`
     const longRes = await fetch(longLivedUrl)
     const longData = await longRes.json()
     const accessToken = longData.access_token || shortToken
     const expiresIn = longData.expires_in || 5184000
 
-    // 4. Get Username + IG Professional Account ID (webhook-matching ID)
-    // Per Meta docs: /me?fields=user_id returns the IG_ID that matches webhook entry.id
-    // https://developers.facebook.com/docs/instagram-platform/instagram-api-with-instagram-login/get-started
+    // 7. Retrieve Username & IG Professional Account ID
     let username = `user_${loginUserId}`
-    let businessAccountId = loginUserId // fallback
-    let profilePic: string | null = null
+    let businessAccountId = loginUserId
 
     try {
       const meRes = await fetch(
         `https://graph.instagram.com/v24.0/me?fields=user_id,username,profile_picture_url&access_token=${accessToken}`
       )
       const meData = await meRes.json()
-      console.log("[v0] 📋 /me response:", JSON.stringify(meData))
-
       if (meData.username) username = meData.username
-      if (meData.profile_picture_url) profilePic = meData.profile_picture_url
-      if (meData.user_id) {
-        businessAccountId = meData.user_id.toString()
-        console.log(`[v0] 🎯 Got IG Professional Account ID (user_id): ${businessAccountId}`)
-      } else {
-        console.warn(`[v0] ⚠️ /me did not return user_id, using loginUserId: ${loginUserId}`)
-      }
+      if (meData.user_id) businessAccountId = meData.user_id.toString()
     } catch (e) {
-      console.error("[v0] /me request failed:", e)
+      console.error("[oauth/callback] /me profile fetch error:", e)
     }
 
-    // 6. Save/Update User
+    // 8. Upsert User in Supabase
     const supabase = await getSupabaseServerClient()
-
-    const updates: any = {
+    const updates = {
       username,
       access_token: accessToken,
       token_expires_at: new Date(Date.now() + expiresIn * 1000).toISOString(),
       updated_at: new Date().toISOString(),
       business_account_id: businessAccountId,
-      page_id: businessAccountId, // Always keep in sync
+      page_id: businessAccountId,
     }
-
-    console.log(`[v0] 💾 Saving user: ${username} | id=${loginUserId} | biz_id=${businessAccountId}`)
 
     const { error: upsertError } = await supabase
       .from("users")
       .upsert({ id: loginUserId, ...updates }, { onConflict: "id" })
 
-    if (upsertError) throw upsertError
+    if (upsertError) {
+      console.error("[oauth/callback] User persistence error:", upsertError)
+      throw upsertError
+    }
 
-    const response = NextResponse.json({ success: true, username, userId: loginUserId, profilePic })
-    response.cookies.set("insta_session", JSON.stringify({ username, userId: loginUserId }), {
-      path: "/",
-      maxAge: expiresIn,
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
+    // 9. Issue Cryptographically Signed Session Token
+    const sessionToken = createSessionToken({ userId: loginUserId, username }, expiresIn * 1000)
+
+    // 10. Redirect directly to clean /dashboard URL with defensive headers
+    const dashboardUrl = new URL("/dashboard", request.url)
+    const response = NextResponse.redirect(dashboardUrl, {
+      status: 302,
+      headers: {
+        "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+        Pragma: "no-cache",
+        Expires: "0",
+        "Referrer-Policy": "no-referrer",
+      },
     })
-    return response
 
-  } catch (error: any) {
-    return NextResponse.json({ error: error.message }, { status: 500 })
+    // Set signed, HttpOnly session cookie
+    response.cookies.set(SESSION_COOKIE_NAME, sessionToken, {
+      ...getSessionCookieOptions(),
+      maxAge: expiresIn,
+    })
+
+    // Clear single-use oauth_state cookie on success
+    clearStateCookie(response)
+
+    return response
+  } catch (err: any) {
+    console.error("[oauth/callback] Critical OAuth error:", err?.message || err)
+    const redirectUrl = new URL("/", request.url)
+    redirectUrl.searchParams.set("error", "authentication_failed")
+    const res = NextResponse.redirect(redirectUrl, {
+      status: 302,
+      headers: { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+    })
+    clearStateCookie(res)
+    return res
   }
+}
+
+/**
+ * Direct POST code exchange is disabled.
+ * All token exchange and session issuance occur strictly within the verified GET callback flow.
+ */
+export async function POST(_request: NextRequest) {
+  return NextResponse.json(
+    { error: "Method not allowed. OAuth token exchange must occur via the secure GET callback flow." },
+    {
+      status: 405,
+      headers: {
+        Allow: "GET",
+        "Cache-Control": "no-store",
+      },
+    }
+  )
 }
