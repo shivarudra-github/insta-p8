@@ -1,6 +1,9 @@
 import test, { describe, it, beforeEach, afterEach } from "node:test"
 import assert from "node:assert"
 import crypto from "crypto"
+import fs from "node:fs"
+import path from "node:path"
+import ts from "typescript"
 
 // Set a dedicated high-entropy test SESSION_SECRET
 const TEST_SECRET = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -1015,6 +1018,298 @@ describe("Security Test Suite — Phase 1 Remediation", () => {
       // Claim is now recorded because retry succeeded
       assert.strictEqual(mockStore.webhook_events.length, 1)
       assert.strictEqual(mockStore.webhook_events[0].data?.comment_id, "comment_retry_999")
+    })
+  })
+
+  // =========================================================================
+  // SECTION E: UI REGRESSION TESTS (PostSelector State & Lifecycle)
+  // =========================================================================
+  describe("[REGRESSION] PostSelector UI State & Lifecycle", () => {
+    function loadPostSelector() {
+      const raw = fs.readFileSync(path.resolve(process.cwd(), "components/dashboard/PostSelector.tsx"), "utf8")
+      const transpiled = ts.transpileModule(raw, {
+        compilerOptions: {
+          jsx: ts.JsxEmit.ReactJSX,
+          module: ts.ModuleKind.CommonJS,
+          target: ts.ScriptTarget.ES2022,
+        },
+      })
+
+      function createHarness() {
+        let stateSlots = []
+        let effectSlots = []
+        let stateIdx = 0
+        let effectIdx = 0
+
+        const mockReact = {
+          useState(init) {
+            const idx = stateIdx++
+            if (idx >= stateSlots.length) {
+              stateSlots.push(typeof init === "function" ? init() : init)
+            }
+            const setter = (val) => {
+              const next = typeof val === "function" ? val(stateSlots[idx]) : val
+              stateSlots[idx] = next
+            }
+            return [stateSlots[idx], setter]
+          },
+          useEffect(fn, deps) {
+            const idx = effectIdx++
+            if (idx >= effectSlots.length) {
+              effectSlots.push({ fn, deps, hasRun: false })
+            } else {
+              const prev = effectSlots[idx]
+              const changed = !deps || !prev.deps || deps.some((d, i) => !Object.is(d, prev.deps[i]))
+              if (changed) {
+                prev.fn = fn
+                prev.deps = deps
+                prev.hasRun = false
+              }
+            }
+          },
+          useMemo(fn) {
+            return fn()
+          },
+        }
+
+        const jsxRuntime = {
+          jsx: (type, props) => ({ type, props }),
+          jsxs: (type, props) => ({ type, props }),
+          Fragment: "Fragment",
+        }
+
+        const m = { exports: {} }
+        const fn = new Function("require", "module", "exports", transpiled.outputText)
+        const mockRequire = (id) => {
+          if (id === "react") return mockReact
+          if (id === "react/jsx-runtime") return jsxRuntime
+          if (id === "lucide-react") return new Proxy({}, { get: () => () => null })
+          return {}
+        }
+        fn(mockRequire, m, m.exports)
+
+        const Component = m.exports.PostSelector
+
+        function runRender(props) {
+          stateIdx = 0
+          effectIdx = 0
+          const tree = Component(props)
+          for (const eff of effectSlots) {
+            if (!eff.hasRun) {
+              eff.fn()
+              eff.hasRun = true
+            }
+          }
+          return tree
+        }
+
+        return {
+          runRender,
+          getMode: () => stateSlots[0],
+          getMediaList: () => stateSlots[1],
+          getLoading: () => stateSlots[2],
+          getError: () => stateSlots[3],
+          getIsBrowsing: () => stateSlots[6],
+          getSelectedMedia: () => stateSlots[7],
+        }
+      }
+
+      return { createHarness }
+    }
+
+    it("POSTSELECTOR-01: Switching to Specific Post / Reel and receiving media response preserves specific mode without auto-closing", async () => {
+      const origFetch = global.fetch
+      try {
+        global.fetch = async () => ({
+          ok: true,
+          json: async () => ({
+            data: [
+              { id: "post_1", caption: "First post", media_type: "IMAGE" },
+              { id: "reel_2", caption: "Second reel", media_type: "VIDEO" },
+            ],
+          }),
+        })
+
+        const { createHarness } = loadPostSelector()
+        const harness = createHarness()
+        let selectedId = null
+        let selectedItem = null
+        const props = {
+          userId: "test_user_1",
+          selectedMediaId: selectedId,
+          onSelect: (id, item) => {
+            selectedId = id
+            selectedItem = item
+          },
+        }
+
+        // Mounts initially in 'all' mode
+        let tree = harness.runRender(props)
+        assert.strictEqual(harness.getMode(), "all", "Must initialize in 'all' mode when selectedMediaId is null")
+
+        // User clicks 'Specific Post / Reel' button
+        const specificBtn = tree.props.children[0].props.children[1]
+        specificBtn.props.onClick()
+
+        // Wait for async fetchMedia to complete and update mediaList
+        await new Promise((r) => setTimeout(r, 25))
+
+        // Re-render after state update
+        tree = harness.runRender(props)
+
+        // REGRESSION CHECK: mode must remain 'specific' and mediaList must be populated
+        assert.strictEqual(harness.getMode(), "specific", "Mode must remain 'specific' after mediaList updates (bug was resetting to 'all')")
+        assert.strictEqual(harness.getMediaList().length, 2, "Media list must contain the 2 returned posts")
+        assert.strictEqual(harness.getLoading(), false, "Loading state must be false after fetch completes")
+      } finally {
+        global.fetch = origFetch
+      }
+    })
+
+    it("POSTSELECTOR-02: Empty Instagram media response (0 posts) keeps specific mode open with empty message", async () => {
+      const origFetch = global.fetch
+      try {
+        global.fetch = async () => ({
+          ok: true,
+          json: async () => ({ data: [] }),
+        })
+
+        const { createHarness } = loadPostSelector()
+        const harness = createHarness()
+        const props = {
+          userId: "test_user_empty",
+          selectedMediaId: null,
+          onSelect: () => {},
+        }
+
+        let tree = harness.runRender(props)
+        const specificBtn = tree.props.children[0].props.children[1]
+        specificBtn.props.onClick()
+
+        await new Promise((r) => setTimeout(r, 25))
+        tree = harness.runRender(props)
+
+        assert.strictEqual(harness.getMode(), "specific", "Specific mode must stay open when 0 posts are returned")
+        assert.strictEqual(harness.getMediaList().length, 0, "Media list must be empty")
+        assert.strictEqual(harness.getError(), null, "Error must be null for empty response")
+      } finally {
+        global.fetch = origFetch
+      }
+    })
+
+    it("POSTSELECTOR-03: Media API error keeps specific mode open and sets error state for retry", async () => {
+      const origFetch = global.fetch
+      try {
+        global.fetch = async () => ({
+          ok: false,
+          json: async () => ({ error: "Instagram token expired. Please reconnect." }),
+        })
+
+        const { createHarness } = loadPostSelector()
+        const harness = createHarness()
+        const props = {
+          userId: "test_user_err",
+          selectedMediaId: null,
+          onSelect: () => {},
+        }
+
+        let tree = harness.runRender(props)
+        const specificBtn = tree.props.children[0].props.children[1]
+        specificBtn.props.onClick()
+
+        await new Promise((r) => setTimeout(r, 25))
+        tree = harness.runRender(props)
+
+        assert.strictEqual(harness.getMode(), "specific", "Specific mode must stay open when media fetch fails")
+        assert.strictEqual(harness.getError(), "Instagram token expired. Please reconnect.")
+      } finally {
+        global.fetch = origFetch
+      }
+    })
+
+    it("POSTSELECTOR-04: Clearing selected post retains specific browsing mode without auto-closing", async () => {
+      const origFetch = global.fetch
+      try {
+        global.fetch = async () => ({
+          ok: true,
+          json: async () => ({
+            data: [{ id: "post_42", caption: "Product showcase", media_type: "IMAGE" }],
+          }),
+        })
+
+        const { createHarness } = loadPostSelector()
+        const harness = createHarness()
+        let selectedId = "post_42"
+        let selectedItem = { id: "post_42", caption: "Product showcase" }
+        const props = {
+          userId: "test_user_select",
+          selectedMediaId: selectedId,
+          initialMedia: selectedItem,
+          onSelect: (id, item) => {
+            selectedId = id
+            selectedItem = item
+          },
+        }
+
+        // Mounts directly in specific mode because selectedMediaId is passed
+        let tree = harness.runRender(props)
+        assert.strictEqual(harness.getMode(), "specific", "Must mount in specific mode when selectedMediaId is provided")
+
+        // Deselect post (click 'X' / clear selection)
+        // In specific mode with selected item, children[1] is the specific container
+        const specificContainer = tree.props.children[1]
+        const selectedBanner = specificContainer.props.children
+        const actionButtons = selectedBanner.props.children[2].props.children
+        const clearBtn = actionButtons[1] // the 'X' button
+        clearBtn.props.onClick()
+
+        // After clearing: selectedId in parent became null
+        props.selectedMediaId = selectedId
+        tree = harness.runRender(props)
+
+        assert.strictEqual(harness.getMode(), "specific", "Mode must remain specific after deselecting post")
+        assert.strictEqual(selectedId, null, "Parent onSelect must have been called with null")
+        assert.strictEqual(harness.getIsBrowsing(), true, "isBrowsing must be true to allow selecting another post")
+      } finally {
+        global.fetch = origFetch
+      }
+    })
+
+    it("POSTSELECTOR-05: Switching to All Posts & Reels resets mode to all and clears selection", async () => {
+      const origFetch = global.fetch
+      try {
+        global.fetch = async () => ({
+          ok: true,
+          json: async () => ({ data: [] }),
+        })
+
+        const { createHarness } = loadPostSelector()
+        const harness = createHarness()
+        let selectedId = "post_99"
+        const props = {
+          userId: "test_user_all",
+          selectedMediaId: selectedId,
+          onSelect: (id, item) => {
+            selectedId = id
+          },
+        }
+
+        let tree = harness.runRender(props)
+        assert.strictEqual(harness.getMode(), "specific")
+
+        // Click 'All Posts & Reels' button (index 0)
+        const allBtn = tree.props.children[0].props.children[0]
+        allBtn.props.onClick()
+
+        props.selectedMediaId = selectedId
+        tree = harness.runRender(props)
+
+        assert.strictEqual(harness.getMode(), "all", "Mode must switch to all")
+        assert.strictEqual(selectedId, null, "onSelect must be called with null")
+        assert.strictEqual(harness.getSelectedMedia(), null, "currentSelectedMedia must be null")
+      } finally {
+        global.fetch = origFetch
+      }
     })
   })
 })
