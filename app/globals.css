@@ -254,7 +254,3 @@ body {
 .dashboard-canvas [class*="bg-accent-yellow/"] {
   background-color: var(--accent) !important;
 }
-
-.dashboard-canvas [class*="bg-black/"] {
-  background-color: #0a0a0a !important;
-}
