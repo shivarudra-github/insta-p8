@@ -43,6 +43,47 @@ const DEFAULT_PUBLIC_REPLIES = ["Check your DMs! 📥", "Sent! 🔥", "Check inb
 // After this, we send a single "couldn't verify your follow" message and stop spamming the user.
 const UNLOCK_GATE_MAX_ATTEMPTS = 3
 
+// ============================================================
+// Webhook Idempotency & Deduplication Helpers
+// ============================================================
+function createEventClaimId(eventKey: string): string {
+  const hash = crypto.createHash("sha256").update(eventKey).digest("hex")
+  return `${hash.slice(0, 8)}-${hash.slice(8, 12)}-4${hash.slice(13, 16)}-a${hash.slice(17, 20)}-${hash.slice(20, 32)}`
+}
+
+async function claimWebhookEvent(
+  supabase: any,
+  eventKey: string,
+  userId: any,
+  eventType: string,
+  eventData?: any,
+): Promise<{ claimed: boolean; claimId: string }> {
+  const claimId = createEventClaimId(eventKey)
+  try {
+    const { error } = await supabase.from("webhook_events").insert({
+      id: claimId,
+      event_type: eventType,
+      user_id: userId,
+      data: { event_key: eventKey, ...(eventData || {}) },
+    })
+    if (error) {
+      return { claimed: false, claimId }
+    }
+    return { claimed: true, claimId }
+  } catch (err) {
+    console.error("[webhook] Error claiming webhook event:", err)
+    return { claimed: false, claimId }
+  }
+}
+
+async function releaseWebhookEventClaim(supabase: any, claimId: string): Promise<void> {
+  try {
+    await supabase.from("webhook_events").delete().eq("id", claimId)
+  } catch (err) {
+    console.error("[webhook] Error releasing webhook event claim:", err)
+  }
+}
+
 export async function GET(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams
   const mode = searchParams.get("hub.mode")
@@ -226,7 +267,7 @@ export async function POST(request: NextRequest) {
       let { data: user } = await supabase
         .from("users")
         .select("*")
-        .or(`business_account_id.eq.${webhookId},page_id.eq.${webhookId}`)
+        .or(`id.eq.${webhookId},business_account_id.eq.${webhookId},page_id.eq.${webhookId}`)
         .single()
 
       if (!user) {
@@ -246,7 +287,7 @@ export async function POST(request: NextRequest) {
           const { data: fallbackUser } = await supabase
             .from("users")
             .select("*")
-            .or(`business_account_id.eq.${candidateId},page_id.eq.${candidateId}`)
+            .or(`id.eq.${candidateId},business_account_id.eq.${candidateId},page_id.eq.${candidateId}`)
             .single()
           if (fallbackUser) {
             await supabase.from("users").update({ page_id: webhookId }).eq("id", fallbackUser.id)
@@ -275,265 +316,343 @@ export async function POST(request: NextRequest) {
         continue
       }
 
-      const { data: automations } = await supabase
+      const { data: automationsData } = await supabase
         .from("automations")
         .select("*")
         .eq("user_id", user.id)
         .eq("is_active", true)
 
-      if (!automations?.length) continue
+      const automations = automationsData || []
 
       // ============================================================
       //  PART A: COMMENTS
       // ============================================================
-      if (entry.changes) {
+      if (Array.isArray(entry.changes)) {
         for (const change of entry.changes) {
-          if (change.field !== "comments" || !change.value?.text) continue
+          let claimId: string | null = null
+          try {
+            if (change?.field !== "comments") continue
 
-          const commentId = change.value.id
-          const commentText = change.value.text.toLowerCase().trim()
-          const senderId = change.value.from.id
-          const mediaId = change.value.media.id
-          const parentId = change.value.parent_id || null
+            const val = change?.value
+            if (!val || typeof val !== "object") continue
+            if (!val.id || typeof val.id !== "string" || !val.text || typeof val.text !== "string") continue
+            if (!val.from?.id || typeof val.from.id !== "string") continue
+            if (!val.media?.id || typeof val.media.id !== "string") continue
 
-          if (senderId === webhookId || senderId === user.business_account_id || senderId === user.page_id) continue
+            const commentId = val.id
+            const commentText = val.text.toLowerCase().trim()
+            const senderId = val.from.id
+            const mediaId = val.media.id
+            const parentId = val.parent_id || null
 
-          const commentAutomations = automations.filter((a: any) => a.trigger_source === "comment")
+            if (senderId === webhookId || senderId === user.business_account_id || senderId === user.page_id) continue
 
-          // Priority: specific post reply-all → specific post keyword → global keyword
-          let match = commentAutomations.find(
-            (a: any) => a.specific_media_id === mediaId && a.trigger_type === "reply_all",
-          )
-          if (!match) {
-            match = commentAutomations.find(
-              (a: any) =>
-                a.specific_media_id === mediaId &&
-                a.trigger_type === "keyword" &&
-                keywordMatches(a.trigger_value, commentText),
+            const commentAutomations = automations.filter(
+              (a: any) => a.trigger_source === "comment" && a.is_active === true,
             )
-          }
-          if (!match) {
-            match = commentAutomations.find(
-              (a: any) =>
-                !a.specific_media_id &&
-                a.trigger_type === "keyword" &&
-                keywordMatches(a.trigger_value, commentText),
+            if (commentAutomations.length === 0) continue
+
+            // Priority: specific post reply-all → specific post keyword → global keyword
+            let match = commentAutomations.find(
+              (a: any) => a.specific_media_id === mediaId && a.trigger_type === "reply_all",
             )
+            if (!match) {
+              match = commentAutomations.find(
+                (a: any) =>
+                  a.specific_media_id === mediaId &&
+                  a.trigger_type === "keyword" &&
+                  keywordMatches(a.trigger_value, commentText),
+              )
+            }
+            if (!match) {
+              match = commentAutomations.find(
+                (a: any) =>
+                  !a.specific_media_id &&
+                  a.trigger_type === "keyword" &&
+                  keywordMatches(a.trigger_value, commentText),
+              )
+            }
+            if (!match) continue
+
+            const content = parseContent(match.response_content)
+
+            // Skip nested replies unless user opted in
+            if (parentId && content.include_replies !== true) continue
+
+            // Deduplication / Idempotency claim
+            const claimResult = await claimWebhookEvent(
+              supabase,
+              `comment:${commentId}`,
+              user.id,
+              "comment",
+              { comment_id: commentId, media_id: mediaId, rule_id: match.id },
+            )
+            if (!claimResult.claimed) {
+              console.log(`[webhook] ⏭️ Duplicate comment skipped: ${commentId}`)
+              continue
+            }
+            claimId = claimResult.claimId
+
+            console.log(`[webhook] ✅ Comment match: "${match.name}"`)
+
+            // reply_mode: 'both' (default) | 'dm_only' | 'public_only'
+            const replyMode = content.reply_mode || "both"
+
+            // Helper: pick a public reply from user's rotation list (with defaults fallback)
+            const getPublicReply = (): string => {
+              const pool: string[] =
+                Array.isArray(content.public_replies) && content.public_replies.filter(Boolean).length > 0
+                  ? content.public_replies.filter(Boolean)
+                  : DEFAULT_PUBLIC_REPLIES
+              return pickRandom(pool)
+            }
+
+            let sendSucceeded = true
+
+            // ===== FOLLOWER GATE FOR COMMENTS =====
+            // The gate card is delivered as a *private reply* to the comment. recipient.id
+            // alone won't open a DM with someone who has never messaged the account; private
+            // replies to a comment need comment_id.
+            if (content.check_follow === true) {
+              const followResult = await verifyFollowStatus(senderId, user.access_token)
+
+              if (followResult.follows === true) {
+                console.log(`[webhook] ✅ Comment follower gate: @${senderId} follows @${user.username} — sending content`)
+                if (replyMode !== "dm_only") {
+                  const res = await replyToComment(user.access_token, commentId, getPublicReply())
+                  if (!res?.ok) sendSucceeded = false
+                }
+                if (replyMode !== "public_only") {
+                  const res = await sendAutomationResponse(
+                    user.access_token,
+                    { comment_id: commentId },
+                    content,
+                    { skipTyping: true },
+                  )
+                  if (!res?.ok) sendSucceeded = false
+                }
+              } else if (followResult.follows === false) {
+                console.log(`[webhook] 🔒 Comment follower gate: @${senderId} doesn't follow @${user.username}`)
+                if (replyMode !== "dm_only") {
+                  const res = await replyToComment(user.access_token, commentId, getPublicReply())
+                  if (!res?.ok) sendSucceeded = false
+                }
+                if (replyMode !== "public_only") {
+                  const res = await sendCardDM(
+                    user.access_token,
+                    { comment_id: commentId },
+                    buildFollowGateCard({ username: user.username, ruleId: match.id }),
+                  )
+                  if (!res?.ok) sendSucceeded = false
+                }
+              } else {
+                // null → unverifiable. Distinguish auth vs transient.
+                const isAuthError = followResult.error === 'auth'
+                if (isAuthError) {
+                  // Auth/permission failure — fail CLOSED: send gate card
+                  console.warn(`[webhook] ⚠️ Comment follower gate auth failure for @${senderId}; sending gate`)
+                  if (replyMode !== "dm_only") {
+                    const res = await replyToComment(user.access_token, commentId, getPublicReply())
+                    if (!res?.ok) sendSucceeded = false
+                  }
+                  if (replyMode !== "public_only") {
+                    const res = await sendCardDM(
+                      user.access_token,
+                      { comment_id: commentId },
+                      buildFollowGateCard({ username: user.username, ruleId: match.id }),
+                    )
+                    if (!res?.ok) sendSucceeded = false
+                  }
+                } else {
+                  // Transient failure — fail OPEN: deliver content (with public reply if allowed)
+                  console.warn(`[webhook] ⚠️ Comment follower gate transient failure for @${senderId}; failing open`)
+                  if (replyMode !== "dm_only") {
+                    const res = await replyToComment(user.access_token, commentId, getPublicReply())
+                    if (!res?.ok) sendSucceeded = false
+                  }
+                  if (replyMode !== "public_only") {
+                    const res = await sendAutomationResponse(
+                      user.access_token,
+                      { comment_id: commentId },
+                      content,
+                      { skipTyping: true },
+                    )
+                    if (!res?.ok) sendSucceeded = false
+                  }
+                }
+              }
+            } else {
+              // No follower check required — send normally
+              if (replyMode !== "dm_only") {
+                const res = await replyToComment(user.access_token, commentId, getPublicReply())
+                if (!res?.ok) sendSucceeded = false
+              }
+              if (replyMode !== "public_only") {
+                const res = await sendAutomationResponse(
+                  user.access_token,
+                  { comment_id: commentId },
+                  content,
+                  { skipTyping: true },
+                )
+                if (!res?.ok) sendSucceeded = false
+              }
+            }
+
+            if (!sendSucceeded && claimId) {
+              console.warn(`[webhook] Comment reply failed for ${commentId}, releasing claim for retry`)
+              await releaseWebhookEventClaim(supabase, claimId)
+            }
+          } catch (commentErr) {
+            console.error("[webhook] Error processing comment change:", commentErr)
+            if (claimId) {
+              await releaseWebhookEventClaim(supabase, claimId)
+            }
           }
-          if (!match) continue
-
-                    const content = parseContent(match.response_content)
-
-                    // Skip nested replies unless user opted in
-                    if (parentId && content.include_replies !== true) continue
-
-                    console.log(`[webhook] ✅ Comment match: "${match.name}"`)
-
-                    // reply_mode: 'both' (default) | 'dm_only' | 'public_only'
-                    const replyMode = content.reply_mode || "both"
-
-                    // Helper: pick a public reply from user's rotation list (with defaults fallback)
-                    const getPublicReply = (): string => {
-                      const pool: string[] =
-                        Array.isArray(content.public_replies) && content.public_replies.filter(Boolean).length > 0
-                          ? content.public_replies.filter(Boolean)
-                          : DEFAULT_PUBLIC_REPLIES
-                      return pickRandom(pool)
-                    }
-
-                    // ===== FOLLOWER GATE FOR COMMENTS =====
-                    // The gate card is delivered as a *private reply* to the comment. recipient.id
-                    // alone won't open a DM with someone who has never messaged the account; private
-                    // replies to a comment need comment_id.
-                    if (content.check_follow === true) {
-                      const followResult = await verifyFollowStatus(senderId, user.access_token)
-
-                      if (followResult.follows === true) {
-                        console.log(`[webhook] ✅ Comment follower gate: @${senderId} follows @${user.username} — sending content`)
-                        if (replyMode !== "dm_only") {
-                          await replyToComment(user.access_token, commentId, getPublicReply())
-                        }
-                        if (replyMode !== "public_only") {
-                          await sendAutomationResponse(
-                            user.access_token,
-                            { comment_id: commentId },
-                            content,
-                            { skipTyping: true },
-                          )
-                        }
-                      } else if (followResult.follows === false) {
-                        console.log(`[webhook] 🔒 Comment follower gate: @${senderId} doesn't follow @${user.username}`)
-                        if (replyMode !== "dm_only") {
-                          await replyToComment(user.access_token, commentId, getPublicReply())
-                        }
-                        if (replyMode !== "public_only") {
-                          await sendCardDM(
-                            user.access_token,
-                            { comment_id: commentId },
-                            buildFollowGateCard({ username: user.username, ruleId: match.id }),
-                          )
-                        }
-                      } else {
-                        // null → unverifiable. Distinguish auth vs transient.
-                        const isAuthError = followResult.error === 'auth'
-                        if (isAuthError) {
-                          // Auth/permission failure — fail CLOSED: send gate card
-                          console.warn(`[webhook] ⚠️ Comment follower gate auth failure for @${senderId}; sending gate`)
-                          if (replyMode !== "dm_only") {
-                            await replyToComment(user.access_token, commentId, getPublicReply())
-                          }
-                          if (replyMode !== "public_only") {
-                            await sendCardDM(
-                              user.access_token,
-                              { comment_id: commentId },
-                              buildFollowGateCard({ username: user.username, ruleId: match.id }),
-                            )
-                          }
-                        } else {
-                          // Transient failure — fail OPEN: deliver content (with public reply if allowed)
-                          console.warn(`[webhook] ⚠️ Comment follower gate transient failure for @${senderId}; failing open`)
-                          if (replyMode !== "dm_only") {
-                            await replyToComment(user.access_token, commentId, getPublicReply())
-                          }
-                          if (replyMode !== "public_only") {
-                            await sendAutomationResponse(
-                              user.access_token,
-                              { comment_id: commentId },
-                              content,
-                              { skipTyping: true },
-                            )
-                          }
-                        }
-                      }
-                    } else {
-                      // No follower check required — send normally
-                      if (replyMode !== "dm_only") {
-                        await replyToComment(user.access_token, commentId, getPublicReply())
-                      }
-                      if (replyMode !== "public_only") {
-                        await sendAutomationResponse(
-                          user.access_token,
-                          { comment_id: commentId },
-                          content,
-                          { skipTyping: true },
-                        )
-                      }
-                    }
         }
       }
 
       // ============================================================
       //  PART A.5: STORY AUTOMATIONS (mention / reaction / reply)
       // ============================================================
-      if (entry.messaging) {
+      if (Array.isArray(entry.messaging)) {
         for (const event of entry.messaging) {
-          const senderId = event.sender.id
-          const recipientId = event.recipient.id
-          if (event.read || event.delivery || event.message?.is_echo || senderId === recipientId) continue
+          try {
+            if (!event || typeof event !== "object") continue
+            if (!event.sender?.id || !event.recipient?.id) continue
+            const senderId = event.sender.id
+            const recipientId = event.recipient.id
+            if (event.read || event.delivery || event.message?.is_echo || senderId === recipientId) continue
 
-          const storyAutomations = automations.filter((a: any) => a.trigger_source === "story")
-          if (storyAutomations.length === 0) continue
-
-          let match = null
-          let storyMediaId: string | null = null
-
-          if (event.message?.attachments?.[0]?.type === "story_mention") {
-            storyMediaId = event.message.attachments[0].payload?.url || null
-            match = storyAutomations.find(
-              (a: any) => a.trigger_type === "mention" && (!a.specific_media_id || a.specific_media_id === storyMediaId),
+            const storyAutomations = automations.filter(
+              (a: any) => a.trigger_source === "story" && a.is_active === true,
             )
-          } else if (event.reaction) {
-            const reactionEmoji = event.reaction.emoji
-            storyMediaId = event.reaction.mid || null
-            match = storyAutomations.find((a: any) => {
-              if (a.trigger_type !== "reaction") return false
-              if (a.specific_media_id && a.specific_media_id !== storyMediaId) return false
-              const triggers = a.trigger_value?.split(",").map((t: string) => t.trim()) || []
-              if (triggers.length > 0 && triggers[0] !== "ALL" && triggers[0] !== "ALL_REACTIONS" && triggers[0] !== "") {
-                return triggers.includes(reactionEmoji)
+            if (storyAutomations.length === 0) continue
+
+            let match = null
+            let storyMediaId: string | null = null
+
+            if (event.message?.attachments?.[0]?.type === "story_mention") {
+              storyMediaId = event.message.attachments[0].payload?.url || null
+              match = storyAutomations.find(
+                (a: any) => a.trigger_type === "mention" && (!a.specific_media_id || a.specific_media_id === storyMediaId),
+              )
+            } else if (event.reaction) {
+              const reactionEmoji = event.reaction.emoji
+              storyMediaId = event.reaction.mid || null
+              match = storyAutomations.find((a: any) => {
+                if (a.trigger_type !== "reaction") return false
+                if (a.specific_media_id && a.specific_media_id !== storyMediaId) return false
+                const triggers = a.trigger_value?.split(",").map((t: string) => t.trim()) || []
+                if (triggers.length > 0 && triggers[0] !== "ALL" && triggers[0] !== "ALL_REACTIONS" && triggers[0] !== "") {
+                  return triggers.includes(reactionEmoji)
+                }
+                return true
+              })
+            } else if (event.message?.reply_to?.story) {
+              const messageText = event.message.text || ""
+              storyMediaId = event.message.reply_to.story.id || null
+              match = storyAutomations.find((a: any) => {
+                if (a.trigger_type !== "reply") return false
+                if (a.specific_media_id && a.specific_media_id !== storyMediaId) return false
+                const triggers = a.trigger_value?.split(",").map((t: string) => t.trim()) || []
+                if (
+                  triggers.length > 0 &&
+                  triggers[0] !== "ALL" &&
+                  triggers[0] !== "ALL_MENTIONS" &&
+                  triggers[0] !== ""
+                ) {
+                  return keywordMatches(a.trigger_value, messageText)
+                }
+                return true
+              })
+            }
+
+            if (match) {
+              console.log(`[webhook] ✨ Story match: "${match.name}"`)
+              const content = parseContent(match.response_content)
+
+              if (content.check_follow === true) {
+                const followResult = await verifyFollowStatus(senderId, user.access_token)
+
+                if (followResult.follows === true) {
+                  console.log(`[webhook] ✅ Story follower gate: @${senderId} follows @${user.username} — sending content`)
+                  await sendAutomationResponse(user.access_token, { id: senderId }, content)
+                } else if (followResult.follows === false) {
+                  console.log(`[webhook] 🔒 Story follower gate: @${senderId} doesn't follow @${user.username}`)
+                  await sendCardDM(user.access_token, { id: senderId }, buildFollowGateCard({ username: user.username, ruleId: match.id }))
+                } else {
+                  // null → unverifiable. Distinguish auth vs transient.
+                  const isAuthError = followResult.error === 'auth'
+                  if (isAuthError) {
+                    // Auth failure — fail CLOSED: send gate
+                    console.warn(`[webhook] ⚠️ Story follower gate auth failure for @${senderId}; sending gate`)
+                    await sendCardDM(user.access_token, { id: senderId }, buildFollowGateCard({ username: user.username, ruleId: match.id }))
+                  } else {
+                    // Transient failure — fail OPEN: deliver content
+                    console.warn(`[webhook] ⚠️ Story follower gate transient failure for @${senderId}; failing open`)
+                    await sendAutomationResponse(user.access_token, { id: senderId }, content)
+                  }
+                }
+              } else {
+                // No follower check required — send normally
+                await sendAutomationResponse(user.access_token, { id: senderId }, content)
               }
-              return true
-            })
-          } else if (event.message?.reply_to?.story) {
-            const messageText = event.message.text || ""
-            storyMediaId = event.message.reply_to.story.id || null
-            match = storyAutomations.find((a: any) => {
-              if (a.trigger_type !== "reply") return false
-              if (a.specific_media_id && a.specific_media_id !== storyMediaId) return false
-              const triggers = a.trigger_value?.split(",").map((t: string) => t.trim()) || []
-              if (
-                triggers.length > 0 &&
-                triggers[0] !== "ALL" &&
-                triggers[0] !== "ALL_MENTIONS" &&
-                triggers[0] !== ""
-              ) {
-                return keywordMatches(a.trigger_value, messageText)
-              }
-              return true
-            })
+            }
+          } catch (storyErr) {
+            console.error("[webhook] Error processing story event:", storyErr)
           }
-
-          if (match) {
-                                          console.log(`[webhook] ✨ Story match: "${match.name}"`)
-                                          const content = parseContent(match.response_content)
-
-                                          if (content.check_follow === true) {
-                                            const followResult = await verifyFollowStatus(senderId, user.access_token)
-
-                                            if (followResult.follows === true) {
-                                              console.log(`[webhook] ✅ Story follower gate: @${senderId} follows @${user.username} — sending content`)
-                                              await sendAutomationResponse(user.access_token, { id: senderId }, content)
-                                            } else if (followResult.follows === false) {
-                                              console.log(`[webhook] 🔒 Story follower gate: @${senderId} doesn't follow @${user.username}`)
-                                              await sendCardDM(user.access_token, { id: senderId }, buildFollowGateCard({ username: user.username, ruleId: match.id }))
-                                            } else {
-                                              // null → unverifiable. Distinguish auth vs transient.
-                                              const isAuthError = followResult.error === 'auth'
-                                              if (isAuthError) {
-                                                // Auth failure — fail CLOSED: send gate
-                                                console.warn(`[webhook] ⚠️ Story follower gate auth failure for @${senderId}; sending gate`)
-                                                await sendCardDM(user.access_token, { id: senderId }, buildFollowGateCard({ username: user.username, ruleId: match.id }))
-                                              } else {
-                                                // Transient failure — fail OPEN: deliver content
-                                                console.warn(`[webhook] ⚠️ Story follower gate transient failure for @${senderId}; failing open`)
-                                                await sendAutomationResponse(user.access_token, { id: senderId }, content)
-                                              }
-                                            }
-                                          } else {
-                                            // No follower check required — send normally
-                                            await sendAutomationResponse(user.access_token, { id: senderId }, content)
-                                          }
-                                        }
         }
       }
 
       // ============================================================
       //  PART B: DIRECT MESSAGES
       // ============================================================
-      if (entry.messaging) {
+      if (Array.isArray(entry.messaging)) {
         for (const event of entry.messaging) {
-          if (event.read || event.delivery || event.reaction || event.message?.is_echo) continue
+          let claimId: string | null = null
+          try {
+            if (!event || typeof event !== "object") continue
+            if (!event.sender?.id || !event.recipient?.id) continue
+            if (event.read || event.delivery || event.reaction || event.message?.is_echo) continue
 
-          const senderId = event.sender.id
-          if (senderId === webhookId || senderId === user.business_account_id || senderId === user.page_id) continue
+            const senderId = event.sender.id
+            if (senderId === webhookId || senderId === user.business_account_id || senderId === user.page_id) continue
 
-          let triggerType = ""
-          let triggerValue = ""
+            let triggerType = ""
+            let triggerValue = ""
 
-          if (event.message?.quick_reply?.payload) {
-            triggerType = "postback"
-            triggerValue = event.message.quick_reply.payload
-          } else if (event.message?.text) {
-            triggerType = "keyword"
-            triggerValue = event.message.text.toLowerCase().trim()
-          } else if (event.postback?.payload) {
-            triggerType = "postback"
-            triggerValue = event.postback.payload
-          } else {
-            continue
-          }
+            if (event.message?.quick_reply?.payload) {
+              triggerType = "postback"
+              triggerValue = event.message.quick_reply.payload
+            } else if (event.message?.text) {
+              triggerType = "keyword"
+              triggerValue = event.message.text.toLowerCase().trim()
+            } else if (event.postback?.payload) {
+              triggerType = "postback"
+              triggerValue = event.postback.payload
+            } else {
+              continue
+            }
 
-          console.log(`[webhook] 📩 DM from ${senderId}: "${triggerValue}"`)
+            const mid = event.message?.mid
+            const dedupKey = mid ? `dm:${mid}` : null
+
+            if (dedupKey) {
+              const claimResult = await claimWebhookEvent(
+                supabase,
+                dedupKey,
+                user.id,
+                "message",
+                { mid, sender_id: senderId },
+              )
+              if (!claimResult.claimed) {
+                console.log(`[webhook] ⏭️ Duplicate DM event skipped: ${mid}`)
+                continue
+              }
+              claimId = claimResult.claimId
+            }
+
+            console.log(`[webhook] 📩 DM from ${senderId}: "${triggerValue}"`)
 
           // Inbox bookkeeping runs alongside delivery, not ahead of it. Always
           // joined below so serverless shutdown cannot discard pending writes.
@@ -572,8 +691,8 @@ export async function POST(request: NextRequest) {
             }
 
             if (conv) {
-              await supabase.from("messages").insert({
-                id: event.message?.mid || `mid_${Date.now()}_${Math.random()}`,
+              await supabase.from("messages").upsert({
+                id: mid || event.message?.mid || `mid_${Date.now()}_${Math.random()}`,
                 conversation_id: conv.id,
                 user_id: user.id,
                 sender_id: senderId,
@@ -588,84 +707,95 @@ export async function POST(request: NextRequest) {
           return conv
           })()
 
+          let sendSucceeded = true
+
           try {
-          // ---------- Match automation ----------
-                    const dmAutomations = automations.filter((a: any) => a.trigger_source === "dm" || !a.trigger_source)
-                    let match = null
+            // ---------- Match automation ----------
+            const dmAutomations = automations.filter(
+              (a: any) => (a.trigger_source === "dm" || !a.trigger_source) && a.is_active === true,
+            )
+            let match = null
 
-                    const isUnlockEvent = triggerType === "postback" && triggerValue.startsWith("UNLOCK_CONTENT_")
+            const isUnlockEvent = triggerType === "postback" && triggerValue.startsWith("UNLOCK_CONTENT_")
 
-                    if (triggerType === "postback") {
-                      if (isUnlockEvent) {
-                        const ruleId = triggerValue.replace("UNLOCK_CONTENT_", "")
-                        match = automations.find((a) => a.id === ruleId)
-                      } else if (triggerValue.startsWith("ICE_BREAKER_")) {
-                        const iceBreakerId = triggerValue.replace("ICE_BREAKER_", "")
-                        const { data: ib } = await supabase
-                          .from("ice_breakers")
-                          .select("*")
-                          .eq("id", iceBreakerId)
-                          .eq("user_id", user.id)
-                          .single()
-                        if (ib) {
-                          match = { name: "Ice Breaker: " + ib.question, response_content: { message: ib.response } }
-                        }
-                      } else {
-                        match = automations.find((a) => a.trigger_type === "postback" && a.trigger_value === triggerValue)
-                        // Quick reply payloads can also match keyword rules
-                        if (!match) {
-                          match = dmAutomations.find(
-                            (a) => a.trigger_type === "keyword" && keywordMatches(a.trigger_value, triggerValue.toLowerCase()),
-                          )
-                        }
-                      }
-                    } else {
-                      match = dmAutomations.find(
-                        (a) => a.trigger_type === "keyword" && keywordMatches(a.trigger_value, triggerValue),
-                      )
+            if (triggerType === "postback") {
+              if (isUnlockEvent) {
+                const ruleId = triggerValue.replace("UNLOCK_CONTENT_", "")
+                match = dmAutomations.find((a: any) => a.id === ruleId)
+              } else if (triggerValue.startsWith("ICE_BREAKER_")) {
+                const iceBreakerId = triggerValue.replace("ICE_BREAKER_", "")
+                const { data: ib } = await supabase
+                  .from("ice_breakers")
+                  .select("*")
+                  .eq("id", iceBreakerId)
+                  .eq("user_id", user.id)
+                  .single()
+                if (ib) {
+                  match = { name: "Ice Breaker: " + ib.question, response_content: { message: ib.response }, id: `ib_${ib.id}` }
+                }
+              } else {
+                match = dmAutomations.find((a: any) => a.trigger_type === "postback" && a.trigger_value === triggerValue)
+                // Quick reply payloads can also match keyword rules
+                if (!match) {
+                  match = dmAutomations.find(
+                    (a: any) => a.trigger_type === "keyword" && keywordMatches(a.trigger_value, triggerValue.toLowerCase()),
+                  )
+                }
+              }
+            } else {
+              match = dmAutomations.find(
+                (a: any) => a.trigger_type === "keyword" && keywordMatches(a.trigger_value, triggerValue),
+              )
+            }
+
+            if (!match) {
+              // AI fallback: if no keyword rule matched, try AI auto-reply
+              if (user.groq_auto_reply_enabled && triggerType !== "postback") {
+                console.log(`[webhook] 🤖 No rule match — trying AI auto-reply for DM from ${senderId}`)
+                await sendSenderAction(user.access_token, senderId, "mark_seen")
+                const conv = await incomingSaved // AI needs history; keyword replies do not.
+                const { data: recentMessages } = conv
+                  ? await supabase
+                      .from("messages")
+                      .select("content, is_from_instagram")
+                      .eq("conversation_id", conv.id)
+                      .order("created_at", { ascending: false })
+                      .limit(10)
+                  : { data: [] }
+                const history = (recentMessages || []).reverse().map((message: any) => ({
+                  role: message.is_from_instagram ? "user" as const : "assistant" as const,
+                  content: message.content,
+                }))
+                const aiReply = await generateAIReply(triggerValue, user.ai_context || "", history, user.groq_api_key, user.ai_base_url, user.ai_model)
+                if (aiReply) {
+                  await sendSenderAction(user.access_token, senderId, "typing_on")
+                  const result = await sendTextDM(user.access_token, { id: senderId }, aiReply)
+                  if (!result?.ok) {
+                    sendSucceeded = false
+                  }
+                  if (result?.ok && conv) {
+                    try {
+                      await supabase.from("messages").insert({
+                        id: `mid_ai_${Date.now()}_${Math.random()}`,
+                        conversation_id: conv.id,
+                        user_id: user.id,
+                        sender_id: user.business_account_id,
+                        sender_username: user.username,
+                        content: aiReply,
+                        is_from_instagram: false,
+                      })
+                    } catch (e) {
+                      console.error("[webhook] Failed to save AI reply", e)
                     }
-
-                    if (!match) {
-                      // AI fallback: if no keyword rule matched, try AI auto-reply
-                      if (user.groq_auto_reply_enabled && triggerType !== "postback") {
-                        console.log(`[webhook] 🤖 No rule match — trying AI auto-reply for DM from ${senderId}`)
-                        await sendSenderAction(user.access_token, senderId, "mark_seen")
-                        const conv = await incomingSaved // AI needs history; keyword replies do not.
-                        const { data: recentMessages } = conv
-                          ? await supabase
-                              .from("messages")
-                              .select("content, is_from_instagram")
-                              .eq("conversation_id", conv.id)
-                              .order("created_at", { ascending: false })
-                              .limit(10)
-                          : { data: [] }
-                        const history = (recentMessages || []).reverse().map((message: any) => ({
-                          role: message.is_from_instagram ? "user" as const : "assistant" as const,
-                          content: message.content,
-                        }))
-                        const aiReply = await generateAIReply(triggerValue, user.ai_context || "", history, user.groq_api_key, user.ai_base_url, user.ai_model)
-                        if (aiReply) {
-                          await sendSenderAction(user.access_token, senderId, "typing_on")
-                          const result = await sendTextDM(user.access_token, { id: senderId }, aiReply)
-                          if (result?.ok && conv) {
-                            try {
-                              await supabase.from("messages").insert({
-                                id: `mid_ai_${Date.now()}_${Math.random()}`,
-                                conversation_id: conv.id,
-                                user_id: user.id,
-                                sender_id: user.business_account_id,
-                                sender_username: user.username,
-                                content: aiReply,
-                                is_from_instagram: false,
-                              })
-                            } catch (e) {
-                              console.error("[webhook] Failed to save AI reply", e)
-                            }
-                          }
-                        }
-                      }
-                      continue
-                    }
+                  }
+                }
+              }
+              if (!sendSucceeded && claimId) {
+                console.warn(`[webhook] AI DM reply failed for ${mid}, releasing claim for retry`)
+                await releaseWebhookEventClaim(supabase, claimId)
+              }
+              continue
+            }
 
                     if (!match) continue
 
@@ -691,6 +821,7 @@ export async function POST(request: NextRequest) {
                           await clearUnlockAttempts(attemptKey)
                           console.log(`[webhook] ✅ DM unlock verified for @${senderId}`)
                           const result = await sendAutomationResponse(user.access_token, { id: senderId }, content)
+                          if (!result?.ok) sendSucceeded = false
                           const conv = await incomingSaved
                           if (result?.ok && conv) {
                             try {
@@ -711,6 +842,7 @@ export async function POST(request: NextRequest) {
                           await clearUnlockAttempts(attemptKey)
                           console.log(`[webhook] ❌ DM unlock rejected: @${senderId} still doesn't follow`)
                           const result = await sendCardDM(user.access_token, { id: senderId }, buildFollowGateCard({ username: user.username, ruleId: match.id, title: "❌ Not Following Yet!", subtitle: `We couldn't verify your follow. Please follow @${user.username} and click the button again.` }))
+                          if (!result?.ok) sendSucceeded = false
                           const conv = await incomingSaved
                           if (result?.ok && conv) {
                             try {
@@ -738,6 +870,7 @@ export async function POST(request: NextRequest) {
                                                       { id: senderId },
                                                       "⚠️ We couldn't verify your follow yet. Please reach out if this keeps happening.",
                                                     )
+                                                    if (!result?.ok) sendSucceeded = false
                                                     const conv = await incomingSaved
                                                     if (result?.ok && conv) {
                                                       try {
@@ -757,6 +890,7 @@ export async function POST(request: NextRequest) {
                                                   } else {
                                                     console.warn(`[webhook] ⚠️ DM unlock unverifiable (attempt ${attempts}/${UNLOCK_GATE_MAX_ATTEMPTS}) for @${senderId}`)
                                                     const result = await sendCardDM(user.access_token, { id: senderId }, buildFollowGateCard({ username: user.username, ruleId: match.id, subtitle: `Please follow @${user.username} to see this!` }))
+                                                    if (!result?.ok) sendSucceeded = false
                                                     const conv = await incomingSaved
                                                     if (result?.ok && conv) {
                                                       try {
@@ -783,6 +917,7 @@ export async function POST(request: NextRequest) {
                           await clearUnlockAttempts(attemptKey)
                           console.log(`[webhook] ✅ DM follower gate: @${senderId} follows @${user.username} — sending content`)
                           const result = await sendAutomationResponse(user.access_token, { id: senderId }, content)
+                          if (!result?.ok) sendSucceeded = false
                           const conv = await incomingSaved
                           if (result?.ok && conv) {
                             try {
@@ -803,6 +938,7 @@ export async function POST(request: NextRequest) {
                           await clearUnlockAttempts(attemptKey)
                           console.log(`[webhook] 🔒 DM follower gate: @${senderId} doesn't follow @${user.username}`)
                           const result = await sendCardDM(user.access_token, { id: senderId }, buildFollowGateCard({ username: user.username, ruleId: match.id, subtitle: `Please follow @${user.username} to see this!` }))
+                          if (!result?.ok) sendSucceeded = false
                           const conv = await incomingSaved
                           if (result?.ok && conv) {
                             try {
@@ -827,6 +963,7 @@ export async function POST(request: NextRequest) {
                           if (isAuthError) {
                             console.warn(`[webhook] ⚠️ DM follower gate auth failure for @${senderId}; sending gate`)
                             const result = await sendCardDM(user.access_token, { id: senderId }, buildFollowGateCard({ username: user.username, ruleId: match.id, title: "❌ Verification Failed", subtitle: `We can't verify your follow status. Please follow @${user.username} and try again.` }))
+                            if (!result?.ok) sendSucceeded = false
                             const conv = await incomingSaved
                             if (result?.ok && conv) {
                               try {
@@ -847,6 +984,7 @@ export async function POST(request: NextRequest) {
                             // Transient failure — fail OPEN on initial trigger
                             console.warn(`[webhook] ⚠️ DM follower gate transient failure for @${senderId}; failing open on initial trigger`)
                             const result = await sendAutomationResponse(user.access_token, { id: senderId }, content)
+                            if (!result?.ok) sendSucceeded = false
                             const conv = await incomingSaved
                             if (result?.ok && conv) {
                               try {
@@ -869,6 +1007,7 @@ export async function POST(request: NextRequest) {
                     } else {
                       // No follower check required
                       const result = await sendAutomationResponse(user.access_token, { id: senderId }, content)
+                      if (!result?.ok) sendSucceeded = false
                       const conv = await incomingSaved
                       if (result?.ok && conv) {
                         try {
@@ -886,8 +1025,19 @@ export async function POST(request: NextRequest) {
                         }
                       }
                     }
-          } finally {
-            await incomingSaved
+
+              if (!sendSucceeded && claimId) {
+                console.warn(`[webhook] DM reply failed for ${mid}, releasing claim for retry`)
+                await releaseWebhookEventClaim(supabase, claimId)
+              }
+            } finally {
+              await incomingSaved
+            }
+          } catch (dmErr) {
+            console.error("[webhook] Error processing DM event:", dmErr)
+            if (claimId) {
+              await releaseWebhookEventClaim(supabase, claimId)
+            }
           }
         }
       }

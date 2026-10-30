@@ -66,7 +66,7 @@ export async function POST(request: NextRequest) {
         trigger_value: finalTriggerValue,
         response_type: "pro",
         response_content: content,
-        is_active: true,
+        is_active: false,
         specific_media_id: specific_media_id || null,
       })
       .select()

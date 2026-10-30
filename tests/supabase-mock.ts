@@ -7,6 +7,7 @@ export interface MockStore {
   messages: Array<{ id: string; conversation_id: string; user_id: string; [key: string]: any }>
   users: Array<{ id: string; access_token?: string; username?: string; [key: string]: any }>
   ice_breakers: Array<{ id: string; user_id: string; [key: string]: any }>
+  webhook_events: Array<{ id: string; event_type: string; user_id?: any; data?: any; processed_at?: string }>
 }
 
 export const mockStore: MockStore = {
@@ -15,6 +16,7 @@ export const mockStore: MockStore = {
   messages: [],
   users: [],
   ice_breakers: [],
+  webhook_events: [],
 }
 
 export function resetMockStore() {
@@ -23,11 +25,13 @@ export function resetMockStore() {
   mockStore.messages = []
   mockStore.users = []
   mockStore.ice_breakers = []
+  mockStore.webhook_events = []
 }
 
 class QueryBuilder {
   private table: string
   private filters: Array<{ field: string; value: any }> = []
+  private orClauses: Array<Array<{ field: string; op: string; value: string }>> = []
   private isDelete = false
   private isUpdate = false
   private updateData: any = null
@@ -57,6 +61,20 @@ class QueryBuilder {
   insert(data: any) {
     const list = Array.isArray(data) ? data : [data]
     const tableData = (mockStore as any)[this.table] || []
+
+    for (const item of list) {
+      if (item.id && tableData.some((r: any) => String(r.id) === String(item.id))) {
+        const error = { code: "23505", message: "duplicate key value violates unique constraint" }
+        return {
+          select: () => ({
+            single: async () => ({ data: null, error }),
+            then: (resolve: any) => resolve({ data: null, error }),
+          }),
+          then: (resolve: any) => resolve({ data: null, error }),
+        }
+      }
+    }
+
     const inserted = list.map((item) => ({
       id: item.id || `mock_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       ...item,
@@ -87,6 +105,18 @@ class QueryBuilder {
     return this
   }
 
+  or(clause: string) {
+    const conditions = clause.split(",").map((part) => {
+      const pieces = part.trim().split(".")
+      const field = pieces[0]
+      const op = pieces[1]
+      const value = pieces.slice(2).join(".")
+      return { field, op, value }
+    })
+    this.orClauses.push(conditions)
+    return this
+  }
+
   order(_field: string, _opts?: any) {
     return this
   }
@@ -110,6 +140,18 @@ class QueryBuilder {
     // Apply all .eq() filters
     for (const { field, value } of this.filters) {
       rows = rows.filter((r) => String(r[field]) === String(value))
+    }
+
+    // Apply all .or() clauses
+    for (const conditions of this.orClauses) {
+      rows = rows.filter((row) =>
+        conditions.some(({ field, op, value }) => {
+          if (op === "eq") {
+            return String(row[field]) === String(value)
+          }
+          return false
+        })
+      )
     }
 
     if (this.isDelete) {

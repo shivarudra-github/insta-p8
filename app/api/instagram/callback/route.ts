@@ -12,6 +12,17 @@ export async function GET(request: NextRequest) {
 
   const isProd = process.env.NODE_ENV === "production"
 
+  // 1. Derive the public application origin from NEXT_PUBLIC_INSTAGRAM_REDIRECT_URI.
+  // This ensures all redirects go to the public host (e.g. Cloudflare tunnel) rather than
+  // resolving to an internal localhost socket/port.
+  const configuredRedirectUri = process.env.NEXT_PUBLIC_INSTAGRAM_REDIRECT_URI
+  let appOrigin: string
+  try {
+    appOrigin = configuredRedirectUri ? new URL(configuredRedirectUri).origin : new URL(request.url).origin
+  } catch {
+    appOrigin = new URL(request.url).origin
+  }
+
   // Helper to clear oauth_state cookie on error redirects
   const clearStateCookie = (res: NextResponse) => {
     res.cookies.set("oauth_state", "", {
@@ -26,7 +37,7 @@ export async function GET(request: NextRequest) {
   // 1. Handle Meta OAuth Error Responses
   if (error) {
     console.warn("[oauth/callback] Meta returned error:", error, errorDescription)
-    const redirectUrl = new URL("/", request.url)
+    const redirectUrl = new URL("/", appOrigin)
     redirectUrl.searchParams.set("error", errorDescription || error)
     const res = NextResponse.redirect(redirectUrl, {
       status: 302,
@@ -48,7 +59,7 @@ export async function GET(request: NextRequest) {
 
   if (!isStateValid) {
     console.warn("[oauth/callback] Potential CSRF or expired state nonce. Verification failed.")
-    const redirectUrl = new URL("/", request.url)
+    const redirectUrl = new URL("/", appOrigin)
     redirectUrl.searchParams.set("error", "invalid_oauth_state")
     const res = NextResponse.redirect(redirectUrl, {
       status: 302,
@@ -61,7 +72,7 @@ export async function GET(request: NextRequest) {
   // 3. Ensure Authorization Code is Present
   if (!code) {
     console.warn("[oauth/callback] Missing authorization code")
-    const redirectUrl = new URL("/", request.url)
+    const redirectUrl = new URL("/", appOrigin)
     redirectUrl.searchParams.set("error", "missing_code")
     const res = NextResponse.redirect(redirectUrl, {
       status: 302,
@@ -96,10 +107,55 @@ export async function GET(request: NextRequest) {
       body: tokenParams.toString(),
     })
 
-    const tokenData = await tokenRes.json()
+    // Safe response parsing: read as text, parse JSON safely
+    const rawTokenBody = await tokenRes.text()
+    let tokenData: any = null
+    try {
+      tokenData = JSON.parse(rawTokenBody)
+    } catch {
+      const sanitizedBodyPreview = rawTokenBody
+        .replace(/[\r\n\t]+/g, " ")
+        .replace(/[^a-zA-Z0-9\s.,:;_\-/<>=]/g, "")
+        .trim()
+        .slice(0, 150)
+      console.error(
+        `[oauth/callback] Token exchange returned non-JSON response. HTTP status: ${tokenRes.status}. Body preview: ${sanitizedBodyPreview}`
+      )
+      const redirectUrl = new URL("/", appOrigin)
+      redirectUrl.searchParams.set("error", "token_exchange_failed")
+      const res = NextResponse.redirect(redirectUrl, {
+        status: 302,
+        headers: { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+      })
+      clearStateCookie(res)
+      return res
+    }
+
     if (!tokenRes.ok) {
-      console.error("[oauth/callback] Token exchange failed:", tokenData.error_message || tokenData)
-      const redirectUrl = new URL("/", request.url)
+      const sanitizedError =
+        typeof tokenData?.error_message === "string"
+          ? tokenData.error_message.slice(0, 200)
+          : typeof tokenData?.error?.message === "string"
+          ? tokenData.error.message.slice(0, 200)
+          : "token_exchange_failed"
+      console.error(
+        `[oauth/callback] Token exchange failed. HTTP status: ${tokenRes.status}: ${sanitizedError}`
+      )
+      const redirectUrl = new URL("/", appOrigin)
+      redirectUrl.searchParams.set("error", "token_exchange_failed")
+      const res = NextResponse.redirect(redirectUrl, {
+        status: 302,
+        headers: { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+      })
+      clearStateCookie(res)
+      return res
+    }
+
+    if (!tokenData?.access_token || !tokenData?.user_id) {
+      console.error(
+        `[oauth/callback] Token exchange response missing required tokens. HTTP status: ${tokenRes.status}`
+      )
+      const redirectUrl = new URL("/", appOrigin)
       redirectUrl.searchParams.set("error", "token_exchange_failed")
       const res = NextResponse.redirect(redirectUrl, {
         status: 302,
@@ -115,7 +171,12 @@ export async function GET(request: NextRequest) {
     // 6. Exchange for Long-Lived Token (60 Days)
     const longLivedUrl = `https://graph.instagram.com/access_token?grant_type=ig_exchange_token&client_secret=${clientSecret}&access_token=${shortToken}`
     const longRes = await fetch(longLivedUrl)
-    const longData = await longRes.json()
+    let longData: any = {}
+    try {
+      longData = await longRes.json()
+    } catch {
+      console.warn("[oauth/callback] Long-lived token response was not JSON, falling back to short-lived token")
+    }
     const accessToken = longData.access_token || shortToken
     const expiresIn = longData.expires_in || 5184000
 
@@ -158,7 +219,7 @@ export async function GET(request: NextRequest) {
     const sessionToken = createSessionToken({ userId: loginUserId, username }, expiresIn * 1000)
 
     // 10. Redirect directly to clean /dashboard URL with defensive headers
-    const dashboardUrl = new URL("/dashboard", request.url)
+    const dashboardUrl = new URL("/dashboard", appOrigin)
     const response = NextResponse.redirect(dashboardUrl, {
       status: 302,
       headers: {
@@ -181,7 +242,7 @@ export async function GET(request: NextRequest) {
     return response
   } catch (err: any) {
     console.error("[oauth/callback] Critical OAuth error:", err?.message || err)
-    const redirectUrl = new URL("/", request.url)
+    const redirectUrl = new URL("/", appOrigin)
     redirectUrl.searchParams.set("error", "authentication_failed")
     const res = NextResponse.redirect(redirectUrl, {
       status: 302,

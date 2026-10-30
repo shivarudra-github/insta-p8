@@ -1,4 +1,4 @@
-import test, { describe, it, beforeEach } from "node:test"
+import test, { describe, it, beforeEach, afterEach } from "node:test"
 import assert from "node:assert"
 import crypto from "crypto"
 
@@ -595,6 +595,426 @@ describe("Security Test Suite — Phase 1 Remediation", () => {
       assert.strictEqual(res.status, 200)
       const data = await res.json()
       assert.strictEqual(data.ok, true)
+    })
+  })
+
+  describe("[INTEGRATION] Webhook Reliability & Idempotency Phase 1", () => {
+    const TEST_USER_ID = "99001"
+    const TEST_WEBHOOK_ID = "ig_acc_99001"
+    let originalFetch
+    let capturedRequests
+
+    function makeSignedWebhookRequest(payloadObj) {
+      const payloadStr = JSON.stringify(payloadObj)
+      const sig = "sha256=" + crypto.createHmac("sha256", "test_meta_app_secret_456").update(payloadStr).digest("hex")
+      return new NextRequest("http://localhost:3000/api/instagram/webhook", {
+        method: "POST",
+        headers: { "x-hub-signature-256": sig, "Content-Type": "application/json" },
+        body: payloadStr,
+      })
+    }
+
+    beforeEach(() => {
+      resetMockStore()
+      capturedRequests = []
+      originalFetch = globalThis.fetch
+
+      mockStore.users.push({
+        id: TEST_USER_ID,
+        business_account_id: TEST_WEBHOOK_ID,
+        page_id: "page_99001",
+        username: "testcreator",
+        access_token: "test_token_valid_123",
+        groq_auto_reply_enabled: false,
+      })
+
+      globalThis.fetch = async (url, opts) => {
+        const urlStr = String(url)
+        const bodyStr = opts?.body ? (typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body)) : null
+        capturedRequests.push({ url: urlStr, method: opts?.method || "GET", body: bodyStr })
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: "mock_resp_123", is_user_follow_business: true, username: "fan_account" }),
+          text: async () => JSON.stringify({ id: "mock_resp_123" }),
+        }
+      }
+    })
+
+    afterEach(() => {
+      globalThis.fetch = originalFetch
+    })
+
+    it("WEBHOOK-01: Comment keyword matching executes reply when keyword matches", async () => {
+      mockStore.automations.push({
+        id: "rule_comment_price",
+        user_id: TEST_USER_ID,
+        name: "Price Inquiry",
+        trigger_source: "comment",
+        trigger_type: "keyword",
+        trigger_value: "price,cost",
+        response_content: JSON.stringify({ message: "The price is $20", reply_mode: "both" }),
+        is_active: true,
+      })
+
+      const req = makeSignedWebhookRequest({
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            changes: [
+              {
+                field: "comments",
+                value: {
+                  id: "comment_test_101",
+                  text: "What is the price?",
+                  from: { id: "customer_456" },
+                  media: { id: "media_888" },
+                },
+              },
+            ],
+          },
+        ],
+      })
+
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200)
+      const data = await res.json()
+      assert.strictEqual(data.ok, true)
+
+      // Verify outgoing replies were captured
+      assert.ok(capturedRequests.length > 0, "Must have called Instagram API to send reply")
+      // Verify idempotency claim was recorded in webhook_events
+      assert.strictEqual(mockStore.webhook_events.length, 1)
+      assert.strictEqual(mockStore.webhook_events[0].event_type, "comment")
+      assert.strictEqual(mockStore.webhook_events[0].data?.comment_id, "comment_test_101")
+    })
+
+    it("WEBHOOK-02: Paused automation suppression (is_active: false) never triggers replies", async () => {
+      mockStore.automations.push({
+        id: "rule_paused_discount",
+        user_id: TEST_USER_ID,
+        name: "Paused Discount",
+        trigger_source: "comment",
+        trigger_type: "keyword",
+        trigger_value: "discount,sale",
+        response_content: JSON.stringify({ message: "Discount code: SAVE50" }),
+        is_active: false,
+      })
+
+      const req = makeSignedWebhookRequest({
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            changes: [
+              {
+                field: "comments",
+                value: {
+                  id: "comment_test_102",
+                  text: "Can I get a discount?",
+                  from: { id: "customer_456" },
+                  media: { id: "media_888" },
+                },
+              },
+            ],
+          },
+        ],
+      })
+
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200)
+
+      // Verify NO replies were sent
+      const replyCalls = capturedRequests.filter((r) => r.method === "POST" && r.url.includes("graph.instagram.com"))
+      assert.strictEqual(replyCalls.length, 0, "Paused automation must NOT trigger any reply")
+    })
+
+    it("WEBHOOK-03: DM persistence continues even with 0 active automations", async () => {
+      mockStore.automations = [] // Zero active automations
+
+      const req = makeSignedWebhookRequest({
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            messaging: [
+              {
+                sender: { id: "fan_321" },
+                recipient: { id: TEST_WEBHOOK_ID },
+                message: {
+                  mid: "mid_test_321_001",
+                  text: "Hey! Just wanted to say I love your videos!",
+                },
+              },
+            ],
+          },
+        ],
+      })
+
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200)
+
+      // Verify conversation was created
+      const conv = mockStore.conversations.find((c) => c.recipient_id === "fan_321")
+      assert.ok(conv, "Conversation record must be created")
+      assert.strictEqual(conv.user_id, TEST_USER_ID)
+
+      // Verify message was persisted
+      const msg = mockStore.messages.find((m) => m.id === "mid_test_321_001")
+      assert.ok(msg, "Message record must be saved")
+      assert.strictEqual(msg.user_id, TEST_USER_ID)
+      assert.strictEqual(msg.content, "hey! just wanted to say i love your videos!")
+
+      // Verify deduplication claim was recorded
+      assert.strictEqual(mockStore.webhook_events.length, 1)
+      assert.strictEqual(mockStore.webhook_events[0].data?.mid, "mid_test_321_001")
+    })
+
+    it("WEBHOOK-04: Duplicate comment suppression skips replies on replayed webhook", async () => {
+      mockStore.automations.push({
+        id: "rule_comment_guide",
+        user_id: TEST_USER_ID,
+        name: "Guide Request",
+        trigger_source: "comment",
+        trigger_type: "keyword",
+        trigger_value: "guide",
+        response_content: JSON.stringify({ message: "Here is your free guide!" }),
+        is_active: true,
+      })
+
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            changes: [
+              {
+                field: "comments",
+                value: {
+                  id: "comment_dup_555",
+                  text: "Send me the guide please",
+                  from: { id: "customer_777" },
+                  media: { id: "media_888" },
+                },
+              },
+            ],
+          },
+        ],
+      }
+
+      // First webhook delivery
+      const req1 = makeSignedWebhookRequest(payload)
+      const res1 = await instagramWebhook.POST(req1)
+      assert.strictEqual(res1.status, 200)
+      const initialCallCount = capturedRequests.filter((r) => r.method === "POST" && r.url.includes("graph.instagram.com")).length
+      assert.ok(initialCallCount > 0, "First delivery must send reply")
+
+      // Second webhook delivery (replay/retry of the exact same comment)
+      const req2 = makeSignedWebhookRequest(payload)
+      const res2 = await instagramWebhook.POST(req2)
+      assert.strictEqual(res2.status, 200)
+
+      const totalCallCount = capturedRequests.filter((r) => r.method === "POST" && r.url.includes("graph.instagram.com")).length
+      assert.strictEqual(totalCallCount, initialCallCount, "Duplicate delivery must NOT send duplicate replies")
+    })
+
+    it("WEBHOOK-05: Duplicate DM mid suppression skips redundant processing and replies", async () => {
+      mockStore.automations.push({
+        id: "rule_dm_info",
+        user_id: TEST_USER_ID,
+        name: "Info Rule",
+        trigger_source: "dm",
+        trigger_type: "keyword",
+        trigger_value: "info",
+        response_content: JSON.stringify({ message: "Here is the info packet!" }),
+        is_active: true,
+      })
+
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            messaging: [
+              {
+                sender: { id: "customer_999" },
+                recipient: { id: TEST_WEBHOOK_ID },
+                message: {
+                  mid: "mid_dup_dm_999",
+                  text: "info",
+                },
+              },
+            ],
+          },
+        ],
+      }
+
+      // First delivery
+      const req1 = makeSignedWebhookRequest(payload)
+      const res1 = await instagramWebhook.POST(req1)
+      assert.strictEqual(res1.status, 200)
+      const initialCallCount = capturedRequests.filter((r) => r.method === "POST" && r.url.includes("graph.instagram.com")).length
+      assert.ok(initialCallCount > 0, "First DM must send reply")
+
+      // Second delivery (replay)
+      const req2 = makeSignedWebhookRequest(payload)
+      const res2 = await instagramWebhook.POST(req2)
+      assert.strictEqual(res2.status, 200)
+
+      const totalCallCount = capturedRequests.filter((r) => r.method === "POST" && r.url.includes("graph.instagram.com")).length
+      assert.strictEqual(totalCallCount, initialCallCount, "Duplicate DM must NOT send duplicate reply")
+      assert.strictEqual(mockStore.messages.filter((m) => m.id === "mid_dup_dm_999").length, 1, "Must not duplicate message")
+    })
+
+    it("WEBHOOK-06: Malformed comment event is skipped safely without aborting valid events in batch", async () => {
+      mockStore.automations.push({
+        id: "rule_comment_valid",
+        user_id: TEST_USER_ID,
+        name: "Batch Valid Rule",
+        trigger_source: "comment",
+        trigger_type: "keyword",
+        trigger_value: "start",
+        response_content: JSON.stringify({ message: "Started successfully!" }),
+        is_active: true,
+      })
+
+      const req = makeSignedWebhookRequest({
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            changes: [
+              // Malformed change 1: missing from
+              { field: "comments", value: { id: "bad_1", text: "start", media: { id: "m1" } } },
+              // Malformed change 2: missing media
+              { field: "comments", value: { id: "bad_2", text: "start", from: { id: "f1" } } },
+              // Malformed change 3: missing id
+              { field: "comments", value: { text: "start", from: { id: "f1" }, media: { id: "m1" } } },
+              // Malformed change 4: value is null
+              { field: "comments", value: null },
+              // Valid change 5: complete and matching keyword
+              {
+                field: "comments",
+                value: {
+                  id: "valid_comment_in_batch",
+                  text: "start now please",
+                  from: { id: "customer_good" },
+                  media: { id: "media_good" },
+                },
+              },
+            ],
+          },
+        ],
+      })
+
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200)
+      const data = await res.json()
+      assert.strictEqual(data.ok, true)
+
+      // The valid comment was processed and claimed
+      assert.strictEqual(mockStore.webhook_events.length, 1)
+      assert.strictEqual(mockStore.webhook_events[0].data?.comment_id, "valid_comment_in_batch")
+    })
+
+    it("WEBHOOK-07: Resolves user when entry.id matches user primary key ID", async () => {
+      mockStore.automations = []
+
+      // Webhook where entry.id is TEST_USER_ID instead of TEST_WEBHOOK_ID
+      const req = makeSignedWebhookRequest({
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_USER_ID,
+            messaging: [
+              {
+                sender: { id: "fan_primary_id" },
+                recipient: { id: TEST_USER_ID },
+                message: {
+                  mid: "mid_primary_id_test",
+                  text: "Testing primary key ID lookup",
+                },
+              },
+            ],
+          },
+        ],
+      })
+
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200)
+      const msg = mockStore.messages.find((m) => m.id === "mid_primary_id_test")
+      assert.ok(msg, "Message should be saved via user primary key ID resolution")
+      assert.strictEqual(msg.user_id, TEST_USER_ID)
+    })
+
+    it("WEBHOOK-08: Failed processing releases claim so event remains retryable", async () => {
+      mockStore.automations.push({
+        id: "rule_retry_test",
+        user_id: TEST_USER_ID,
+        name: "Retry Rule",
+        trigger_source: "comment",
+        trigger_type: "keyword",
+        trigger_value: "retry",
+        response_content: JSON.stringify({ message: "Will fail on first attempt" }),
+        is_active: true,
+      })
+
+      // Simulate Instagram API failure on first attempt
+      let shouldFail = true
+      globalThis.fetch = async (url, opts) => {
+        if (shouldFail && opts?.method === "POST" && String(url).includes("graph.instagram.com")) {
+          return {
+            ok: false,
+            status: 500,
+            json: async () => ({ error: { message: "Internal Instagram API transient error" } }),
+            text: async () => JSON.stringify({ error: "transient" }),
+          }
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: "mock_success_id", is_user_follow_business: true }),
+          text: async () => JSON.stringify({ id: "mock_success_id" }),
+        }
+      }
+
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            changes: [
+              {
+                field: "comments",
+                value: {
+                  id: "comment_retry_999",
+                  text: "please retry",
+                  from: { id: "customer_retry" },
+                  media: { id: "media_retry" },
+                },
+              },
+            ],
+          },
+        ],
+      }
+
+      // Attempt 1: fails
+      const req1 = makeSignedWebhookRequest(payload)
+      await instagramWebhook.POST(req1)
+
+      // Claim should have been released because send failed
+      assert.strictEqual(mockStore.webhook_events.length, 0, "Claim must be released on failure")
+
+      // Attempt 2: succeeds
+      shouldFail = false
+      const req2 = makeSignedWebhookRequest(payload)
+      const res2 = await instagramWebhook.POST(req2)
+      assert.strictEqual(res2.status, 200)
+
+      // Claim is now recorded because retry succeeded
+      assert.strictEqual(mockStore.webhook_events.length, 1)
+      assert.strictEqual(mockStore.webhook_events[0].data?.comment_id, "comment_retry_999")
     })
   })
 })
