@@ -8,6 +8,9 @@
   animation: none;
   mix-blend-mode: normal;
 }
+::view-transition-new(root) {
+  z-index: 2147483647;
+}
 
 /* ============================================================
    Light theme (default). WCAG AA targets ≥4.5:1 for body text.

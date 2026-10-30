@@ -20,10 +20,40 @@ const STORAGE_KEY = "insta-p8-theme"
  * the color-scheme meta so native form controls (scrollbars, inputs) follow.
  */
 function applyTheme(resolved: "light" | "dark") {
+  if (typeof document === "undefined") return
   const root = document.documentElement
+
+  // Temporarily disable CSS transitions on all elements so theme colors, borders,
+  // and surfaces update atomically in a single frame without lingering transitions.
+  const style = document.createElement("style")
+  style.appendChild(
+    document.createTextNode(
+      `*, *::before, *::after {
+        -webkit-transition: none !important;
+        -moz-transition: none !important;
+        -o-transition: none !important;
+        -ms-transition: none !important;
+        transition: none !important;
+      }`
+    )
+  )
+  document.head.appendChild(style)
+
   root.classList.toggle("dark", resolved === "dark")
   root.style.colorScheme = resolved
   root.dataset.theme = resolved
+
+  // Force reflow to commit new theme styles synchronously with transitions disabled
+  void window.getComputedStyle(style).opacity
+
+  // Re-enable transitions in the next frame so hover states work normally
+  requestAnimationFrame(() => {
+    try {
+      if (style.parentNode) {
+        style.parentNode.removeChild(style)
+      }
+    } catch {}
+  })
 }
 
 function getSystemTheme(): "light" | "dark" {
