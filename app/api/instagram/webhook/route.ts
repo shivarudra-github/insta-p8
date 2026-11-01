@@ -3,7 +3,6 @@
 import crypto from "crypto"
 import { type NextRequest, NextResponse } from "next/server"
 import { getSupabaseServerClient } from "@/lib/supabase-server"
-import { ensureSchema } from "@/lib/supabase-migrate"
 import {
   sendTextDM,
   sendCardDM,
@@ -11,7 +10,6 @@ import {
   sendSenderAction,
   replyToComment,
   fetchProfile,
-  verifyIdOwnership,
   sleep,
   buildFollowGateCard,
 } from "@/lib/instagram-api"
@@ -240,7 +238,7 @@ export async function POST(request: NextRequest) {
         `[webhook] 401: ${!signature ? "no x-hub-signature-256 header" : "signature mismatch"}; ` +
           `secrets configured: ${APP_SECRETS.length}; received=${signature?.slice(7, 19) ?? "-"} computed=[${computed}] bodyLen=${rawBody.length}`,
       )
-      if (process.env.DISABLE_WEBHOOK_SIGNATURE_CHECK === "true") {
+      if (process.env.NODE_ENV !== "production" && process.env.DISABLE_WEBHOOK_SIGNATURE_CHECK === "true") {
         console.warn("[webhook] SIGNATURE CHECK BYPASSED — remove DISABLE_WEBHOOK_SIGNATURE_CHECK after debugging")
       } else {
         return NextResponse.json({ error: "Invalid signature" }, { status: 401 })
@@ -248,8 +246,6 @@ export async function POST(request: NextRequest) {
     }
     const body = JSON.parse(rawBody)
     if (!body.entry) return NextResponse.json({ ok: true })
-    // Ensure schema is up-to-date on every cold start (idempotent, no-op if all tables exist)
-    ensureSchema().catch((e) => console.warn("[webhook] ensureSchema failed:", e?.message))
     const supabase = await getSupabaseServerClient()
 
     for (const entry of body.entry) {
@@ -262,6 +258,10 @@ export async function POST(request: NextRequest) {
       }
 
       const webhookId = entry.id
+      if (typeof webhookId !== "string" || !/^\d+$/.test(webhookId)) {
+        console.warn(`[webhook] Invalid or malformed entry.id: ${JSON.stringify(webhookId)}`)
+        continue
+      }
 
       // ---------- User resolution: direct, payload fallback, token verify ----------
       let { data: user } = await supabase
@@ -284,6 +284,7 @@ export async function POST(request: NextRequest) {
         }
         for (const candidateId of candidateIds) {
           if (candidateId === webhookId) continue
+          if (!/^\d+$/.test(candidateId)) continue
           const { data: fallbackUser } = await supabase
             .from("users")
             .select("*")
@@ -293,20 +294,6 @@ export async function POST(request: NextRequest) {
             await supabase.from("users").update({ page_id: webhookId }).eq("id", fallbackUser.id)
             user = fallbackUser
             break
-          }
-        }
-      }
-
-      if (!user) {
-        const { data: allUsers } = await supabase.from("users").select("*")
-        if (allUsers) {
-          for (const candidate of allUsers) {
-            if (!candidate.access_token) continue
-            if (await verifyIdOwnership(candidate.access_token, webhookId)) {
-              await supabase.from("users").update({ page_id: webhookId }).eq("id", candidate.id)
-              user = candidate
-              break
-            }
           }
         }
       }

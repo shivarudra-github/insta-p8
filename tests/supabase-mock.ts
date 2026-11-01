@@ -8,6 +8,7 @@ export interface MockStore {
   users: Array<{ id: string; access_token?: string; username?: string; [key: string]: any }>
   ice_breakers: Array<{ id: string; user_id: string; [key: string]: any }>
   webhook_events: Array<{ id: string; event_type: string; user_id?: any; data?: any; processed_at?: string }>
+  queries: Array<{ table: string; filters: Array<{ field: string; value: any }>; orClauses: Array<Array<{ field: string; op: string; value: string }>>; isSingle: boolean }>
 }
 
 export const mockStore: MockStore = {
@@ -17,6 +18,7 @@ export const mockStore: MockStore = {
   users: [],
   ice_breakers: [],
   webhook_events: [],
+  queries: [],
 }
 
 export function resetMockStore() {
@@ -26,6 +28,7 @@ export function resetMockStore() {
   mockStore.users = []
   mockStore.ice_breakers = []
   mockStore.webhook_events = []
+  mockStore.queries = []
 }
 
 class QueryBuilder {
@@ -135,6 +138,14 @@ class QueryBuilder {
   }
 
   private async execute() {
+    if (mockStore.queries) {
+      mockStore.queries.push({
+        table: this.table,
+        filters: [...this.filters],
+        orClauses: [...this.orClauses],
+        isSingle: this.isSingle,
+      })
+    }
     let rows: any[] = [...((mockStore as any)[this.table] || [])]
 
     // Apply all .eq() filters

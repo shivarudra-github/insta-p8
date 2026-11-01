@@ -599,11 +599,35 @@ describe("Security Test Suite — Phase 1 Remediation", () => {
       const data = await res.json()
       assert.strictEqual(data.ok, true)
     })
+
+    it("ROUTE-LIFECYCLE-09: POST /api/instagram/webhook with DISABLE_WEBHOOK_SIGNATURE_CHECK=true in production -> 401", async () => {
+      const originalEnv = process.env.NODE_ENV
+      const originalBypass = process.env.DISABLE_WEBHOOK_SIGNATURE_CHECK
+      try {
+        process.env.NODE_ENV = "production"
+        process.env.DISABLE_WEBHOOK_SIGNATURE_CHECK = "true"
+        const req = new NextRequest("http://localhost:3000/api/instagram/webhook", {
+          method: "POST",
+          body: JSON.stringify({ object: "instagram" }),
+        })
+        const res = await instagramWebhook.POST(req)
+        assert.strictEqual(res.status, 401)
+        const data = await res.json()
+        assert.strictEqual(data.error, "Invalid signature")
+      } finally {
+        process.env.NODE_ENV = originalEnv
+        if (originalBypass !== undefined) {
+          process.env.DISABLE_WEBHOOK_SIGNATURE_CHECK = originalBypass
+        } else {
+          delete process.env.DISABLE_WEBHOOK_SIGNATURE_CHECK
+        }
+      }
+    })
   })
 
   describe("[INTEGRATION] Webhook Reliability & Idempotency Phase 1", () => {
     const TEST_USER_ID = "99001"
-    const TEST_WEBHOOK_ID = "ig_acc_99001"
+    const TEST_WEBHOOK_ID = "99002"
     let originalFetch
     let capturedRequests
 
@@ -625,7 +649,7 @@ describe("Security Test Suite — Phase 1 Remediation", () => {
       mockStore.users.push({
         id: TEST_USER_ID,
         business_account_id: TEST_WEBHOOK_ID,
-        page_id: "page_99001",
+        page_id: "99003",
         username: "testcreator",
         access_token: "test_token_valid_123",
         groq_auto_reply_enabled: false,
@@ -1021,6 +1045,519 @@ describe("Security Test Suite — Phase 1 Remediation", () => {
     })
   })
 
+  describe("[INTEGRATION] Webhook ID Validation & PostgREST Filter Injection Prevention (SEC-API-05)", () => {
+    const VALID_USER_ID = "99001"
+    const VALID_WEBHOOK_ID = "99002"
+    let capturedRequests
+    let originalFetch
+
+    function makeSignedRequest(payloadObj) {
+      const payloadStr = JSON.stringify(payloadObj)
+      const sig = "sha256=" + crypto.createHmac("sha256", "test_meta_app_secret_456").update(payloadStr).digest("hex")
+      return new NextRequest("http://localhost:3000/api/instagram/webhook", {
+        method: "POST",
+        headers: { "x-hub-signature-256": sig, "Content-Type": "application/json" },
+        body: payloadStr,
+      })
+    }
+
+    beforeEach(() => {
+      resetMockStore()
+      capturedRequests = []
+      originalFetch = globalThis.fetch
+
+      mockStore.users.push({
+        id: VALID_USER_ID,
+        business_account_id: VALID_WEBHOOK_ID,
+        page_id: "99003",
+        username: "testcreator",
+        access_token: "test_token_valid_123",
+      })
+
+      mockStore.automations.push({
+        id: "rule_test_id_validation",
+        user_id: VALID_USER_ID,
+        name: "Validation Rule",
+        trigger_source: "comment",
+        trigger_type: "keyword",
+        trigger_value: "hello",
+        response_content: JSON.stringify({ message: "Valid ID reply" }),
+        is_active: true,
+      })
+
+      globalThis.fetch = async (url, opts) => {
+        capturedRequests.push({ url: String(url), method: opts?.method || "GET" })
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: "mock_resp_123", is_user_follow_business: true }),
+          text: async () => JSON.stringify({ id: "mock_resp_123" }),
+        }
+      }
+    })
+
+    afterEach(() => {
+      globalThis.fetch = originalFetch
+    })
+
+    it("WEBHOOK-ID-01: Rejects empty string entry.id before database query", async () => {
+      const req = makeSignedRequest({
+        object: "instagram",
+        entry: [{ id: "", changes: [{ field: "comments", value: { id: "c1", text: "hello", from: { id: "u1" } } }] }],
+      })
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200)
+      assert.strictEqual(mockStore.webhook_events.length, 0, "No event claimed for empty ID")
+      assert.strictEqual(capturedRequests.length, 0, "No Graph API calls dispatched")
+    })
+
+    it("WEBHOOK-ID-02: Rejects entry.id containing commas (PostgREST injection attempt) before query", async () => {
+      const req = makeSignedRequest({
+        object: "instagram",
+        entry: [{ id: "123,id.eq.456", changes: [{ field: "comments", value: { id: "c1", text: "hello", from: { id: "u1" } } }] }],
+      })
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200)
+      assert.strictEqual(mockStore.webhook_events.length, 0, "No event claimed for comma-injected ID")
+      assert.strictEqual(capturedRequests.length, 0, "No Graph API calls dispatched")
+    })
+
+    it("WEBHOOK-ID-03: Rejects entry.id containing parentheses before database query", async () => {
+      const req = makeSignedRequest({
+        object: "instagram",
+        entry: [{ id: "123)or(id.eq.456", changes: [{ field: "comments", value: { id: "c1", text: "hello", from: { id: "u1" } } }] }],
+      })
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200)
+      assert.strictEqual(mockStore.webhook_events.length, 0, "No event claimed for parentheses ID")
+      assert.strictEqual(capturedRequests.length, 0, "No Graph API calls dispatched")
+    })
+
+    it("WEBHOOK-ID-04: Rejects malformed alphanumeric / non-numeric entry.id before database query", async () => {
+      const req = makeSignedRequest({
+        object: "instagram",
+        entry: [{ id: "ig_acc_invalid_alpha", changes: [{ field: "comments", value: { id: "c1", text: "hello", from: { id: "u1" } } }] }],
+      })
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200)
+      assert.strictEqual(mockStore.webhook_events.length, 0, "No event claimed for non-numeric ID")
+      assert.strictEqual(capturedRequests.length, 0, "No Graph API calls dispatched")
+    })
+
+    it("WEBHOOK-ID-05: Rejects non-string entry.id (null, undefined, object) before database query", async () => {
+      const req = makeSignedRequest({
+        object: "instagram",
+        entry: [{ id: null, changes: [{ field: "comments", value: { id: "c1", text: "hello", from: { id: "u1" } } }] }],
+      })
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200)
+      assert.strictEqual(mockStore.webhook_events.length, 0, "No event claimed for null ID")
+      assert.strictEqual(capturedRequests.length, 0, "No Graph API calls dispatched")
+    })
+
+    it("WEBHOOK-ID-06: Skips candidate ID in payload containing commas or parentheses before query", async () => {
+      const req = makeSignedRequest({
+        object: "instagram",
+        entry: [
+          {
+            id: "88888",
+            messaging: [
+              {
+                recipient: { id: "99001,page_id.eq.attack" },
+                message: { mid: "m1", text: "hello" },
+              },
+            ],
+          },
+        ],
+      })
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200)
+      assert.strictEqual(mockStore.webhook_events.length, 0, "No event claimed")
+    })
+
+    it("WEBHOOK-ID-07: Accepts valid numeric string entry.id and executes normal processing", async () => {
+      const req = makeSignedRequest({
+        object: "instagram",
+        entry: [
+          {
+            id: VALID_WEBHOOK_ID,
+            changes: [
+              {
+                field: "comments",
+                value: {
+                  id: "comment_valid_numeric_id",
+                  text: "hello there",
+                  from: { id: "customer_101" },
+                  media: { id: "media_101" },
+                },
+              },
+            ],
+          },
+        ],
+      })
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200)
+      const data = await res.json()
+      assert.strictEqual(data.ok, true)
+      assert.strictEqual(mockStore.webhook_events.length, 1, "Event claimed successfully")
+      assert.ok(capturedRequests.length > 0, "Reply dispatched for valid numeric ID")
+    })
+  })
+
+  describe("[INTEGRATION] Webhook User Resolution & SEC-API-02 Fallback Removal", () => {
+    let capturedRequests
+    let originalFetch
+
+    function makeSignedRequest(payloadObj) {
+      const payloadStr = JSON.stringify(payloadObj)
+      const sig = "sha256=" + crypto.createHmac("sha256", "test_meta_app_secret_456").update(payloadStr).digest("hex")
+      return new NextRequest("http://localhost:3000/api/instagram/webhook", {
+        method: "POST",
+        headers: { "x-hub-signature-256": sig, "Content-Type": "application/json" },
+        body: payloadStr,
+      })
+    }
+
+    beforeEach(() => {
+      resetMockStore()
+      capturedRequests = []
+      originalFetch = globalThis.fetch
+
+      globalThis.fetch = async (url, opts) => {
+        capturedRequests.push({ url: String(url), method: opts?.method || "GET" })
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: "mock_resp_123", is_user_follow_business: true }),
+          text: async () => JSON.stringify({ id: "mock_resp_123" }),
+        }
+      }
+    })
+
+    afterEach(() => {
+      globalThis.fetch = originalFetch
+    })
+
+    it("FALLBACK-REM-01: Known account matching business_account_id resolves directly in Step 1", async () => {
+      mockStore.users.push({
+        id: "user_step1_direct",
+        business_account_id: "1000000001",
+        page_id: "1000000001",
+        username: "directcreator",
+        access_token: "token_step1_direct",
+      })
+      mockStore.automations.push({
+        id: "rule_step1_direct",
+        user_id: "user_step1_direct",
+        name: "Direct Rule",
+        trigger_source: "comment",
+        trigger_type: "keyword",
+        trigger_value: "hello",
+        response_content: JSON.stringify({ message: "Direct resolution reply" }),
+        is_active: true,
+      })
+
+      const req = makeSignedRequest({
+        object: "instagram",
+        entry: [{
+          id: "1000000001",
+          changes: [{
+            field: "comments",
+            value: {
+              id: "comm_direct_01",
+              text: "hello there",
+              from: { id: "fan_1" },
+              media: { id: "media_1" },
+            },
+          }],
+        }],
+      })
+
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200)
+      const data = await res.json()
+      assert.strictEqual(data.ok, true)
+      assert.strictEqual(mockStore.webhook_events.length, 1)
+      assert.strictEqual(mockStore.webhook_events[0].data?.comment_id, "comm_direct_01")
+      assert.ok(capturedRequests.some((r) => r.url.includes("comm_direct_01/replies")))
+    })
+
+    it("FALLBACK-REM-02: Known account matching page_id alias resolves directly in Step 1", async () => {
+      mockStore.users.push({
+        id: "user_step1_alias",
+        business_account_id: "1000000002",
+        page_id: "2000000002",
+        username: "aliascreator",
+        access_token: "token_step1_alias",
+      })
+      mockStore.automations.push({
+        id: "rule_step1_alias",
+        user_id: "user_step1_alias",
+        name: "Alias Rule",
+        trigger_source: "comment",
+        trigger_type: "keyword",
+        trigger_value: "price",
+        response_content: JSON.stringify({ message: "Alias resolution reply" }),
+        is_active: true,
+      })
+
+      const req = makeSignedRequest({
+        object: "instagram",
+        entry: [{
+          id: "2000000002",
+          changes: [{
+            field: "comments",
+            value: {
+              id: "comm_alias_02",
+              text: "what is the price?",
+              from: { id: "fan_2" },
+              media: { id: "media_2" },
+            },
+          }],
+        }],
+      })
+
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200)
+      const data = await res.json()
+      assert.strictEqual(data.ok, true)
+      assert.strictEqual(mockStore.webhook_events.length, 1)
+      assert.strictEqual(mockStore.webhook_events[0].data?.comment_id, "comm_alias_02")
+      assert.ok(capturedRequests.some((r) => r.url.includes("comm_alias_02/replies")))
+    })
+
+    it("FALLBACK-REM-03: Validly signed webhook with unknown numeric ID does not query all users", async () => {
+      mockStore.users.push(
+        { id: "u_exist_1", business_account_id: "111", page_id: "111", access_token: "tok_1" },
+        { id: "u_exist_2", business_account_id: "222", page_id: "222", access_token: "tok_2" },
+      )
+
+      const req = makeSignedRequest({
+        object: "instagram",
+        entry: [{
+          id: "999999999",
+          changes: [{
+            field: "comments",
+            value: {
+              id: "comm_unknown_03",
+              text: "hello",
+              from: { id: "fan_3" },
+              media: { id: "media_3" },
+            },
+          }],
+        }],
+      })
+
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200)
+      const data = await res.json()
+      assert.strictEqual(data.ok, true)
+
+      // Verify that no full table scan on "users" occurred
+      const fullUserScans = mockStore.queries.filter(
+        (q) => q.table === "users" && q.filters.length === 0 && q.orClauses.length === 0,
+      )
+      assert.strictEqual(fullUserScans.length, 0, "Must not execute unfiltered SELECT * FROM users")
+    })
+
+    it("FALLBACK-REM-04: Unknown accounts do NOT trigger verifyIdOwnership or external Graph API calls", async () => {
+      // Populate 5 user candidates with active tokens
+      for (let i = 1; i <= 5; i++) {
+        mockStore.users.push({
+          id: `candidate_user_${i}`,
+          business_account_id: `300000000${i}`,
+          page_id: `300000000${i}`,
+          access_token: `token_candidate_${i}`,
+        })
+      }
+
+      const req = makeSignedRequest({
+        object: "instagram",
+        entry: [{
+          id: "777777777",
+          changes: [{
+            field: "comments",
+            value: {
+              id: "comm_unknown_04",
+              text: "unknown test",
+              from: { id: "fan_4" },
+              media: { id: "media_4" },
+            },
+          }],
+        }],
+      })
+
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200)
+
+      // In the old code, 5 sequential Graph API calls to verifyIdOwnership would have been made.
+      // In the new code, exactly 0 external calls are made.
+      assert.strictEqual(capturedRequests.length, 0, "Must not dispatch any external Graph API calls for unknown accounts")
+    })
+
+    it("FALLBACK-REM-05: Unknown accounts return HTTP 200 { ok: true } acknowledgment and safely skip", async () => {
+      const req = makeSignedRequest({
+        object: "instagram",
+        entry: [{
+          id: "888888888",
+          changes: [{
+            field: "comments",
+            value: {
+              id: "comm_skip_05",
+              text: "skip this cleanly",
+              from: { id: "fan_5" },
+            },
+          }],
+        }],
+      })
+
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200)
+      const data = await res.json()
+      assert.deepStrictEqual(data, { ok: true })
+      assert.strictEqual(mockStore.webhook_events.length, 0, "No event claimed for unresolvable user")
+    })
+
+    it("FALLBACK-REM-06: Step 2 payload candidate resolution (media.owner.id and recipient.id) remains functional and updates page_id", async () => {
+      // User registered with business_account_id = "5000000001", page_id = null
+      mockStore.users.push({
+        id: "user_step2_test",
+        business_account_id: "5000000001",
+        page_id: null,
+        access_token: "token_step2",
+      })
+      mockStore.automations.push({
+        id: "rule_step2_test",
+        user_id: "user_step2_test",
+        name: "Step 2 Rule",
+        trigger_source: "comment",
+        trigger_type: "keyword",
+        trigger_value: "step2",
+        response_content: JSON.stringify({ message: "Step 2 resolved" }),
+        is_active: true,
+      })
+
+      // Webhook arrives with entry.id = "6000000001" (new page ID), but media.owner.id = "5000000001"
+      const req = makeSignedRequest({
+        object: "instagram",
+        entry: [{
+          id: "6000000001",
+          changes: [{
+            field: "comments",
+            value: {
+              id: "comm_step2_06",
+              text: "step2 keyword",
+              from: { id: "fan_6" },
+              media: { id: "media_6", owner: { id: "5000000001" } },
+            },
+          }],
+        }],
+      })
+
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200)
+      const data = await res.json()
+      assert.strictEqual(data.ok, true)
+
+      // Step 2 successfully resolved and healed the user's page_id
+      const updatedUser = mockStore.users.find((u) => u.id === "user_step2_test")
+      assert.strictEqual(updatedUser.page_id, "6000000001", "Step 2 must update page_id to incoming webhookId")
+      assert.strictEqual(mockStore.webhook_events.length, 1)
+      assert.strictEqual(mockStore.webhook_events[0].data?.comment_id, "comm_step2_06")
+
+      // Now verify Step 2 also resolves via recipient.id in messaging events
+      mockStore.users.push({
+        id: "user_step2_dm",
+        business_account_id: "5000000002",
+        page_id: null,
+        access_token: "token_step2_dm",
+      })
+      const dmReq = makeSignedRequest({
+        object: "instagram",
+        entry: [{
+          id: "6000000002",
+          messaging: [{
+            sender: { id: "fan_dm_6" },
+            recipient: { id: "5000000002" },
+            message: { mid: "mid_step2_06", text: "dm payload test" },
+          }],
+        }],
+      })
+      const dmRes = await instagramWebhook.POST(dmReq)
+      assert.strictEqual(dmRes.status, 200)
+      const updatedDmUser = mockStore.users.find((u) => u.id === "user_step2_dm")
+      assert.strictEqual(updatedDmUser.page_id, "6000000002")
+    })
+
+    it("FALLBACK-REM-07: Normal comment and DM processing work end-to-end for resolved accounts", async () => {
+      mockStore.users.push({
+        id: "user_e2e_normal",
+        business_account_id: "7000000001",
+        page_id: "7000000001",
+        username: "e2ecreator",
+        access_token: "token_e2e",
+      })
+      mockStore.automations.push(
+        {
+          id: "rule_e2e_comment",
+          user_id: "user_e2e_normal",
+          name: "E2E Comment Rule",
+          trigger_source: "comment",
+          trigger_type: "keyword",
+          trigger_value: "coupon",
+          response_content: JSON.stringify({ message: "Here is your coupon: SAVE20" }),
+          is_active: true,
+        },
+        {
+          id: "rule_e2e_dm",
+          user_id: "user_e2e_normal",
+          name: "E2E DM Rule",
+          trigger_source: "dm",
+          trigger_type: "keyword",
+          trigger_value: "help",
+          response_content: JSON.stringify({ message: "Support is on the way!" }),
+          is_active: true,
+        },
+      )
+
+      // Test Comment
+      const commentReq = makeSignedRequest({
+        object: "instagram",
+        entry: [{
+          id: "7000000001",
+          changes: [{
+            field: "comments",
+            value: {
+              id: "comm_e2e_07",
+              text: "i want a coupon please",
+              from: { id: "customer_77" },
+              media: { id: "media_77" },
+            },
+          }],
+        }],
+      })
+      const commentRes = await instagramWebhook.POST(commentReq)
+      assert.strictEqual(commentRes.status, 200)
+      assert.ok(capturedRequests.some((r) => r.url.includes("comm_e2e_07/replies")))
+
+      // Test DM
+      const dmReq = makeSignedRequest({
+        object: "instagram",
+        entry: [{
+          id: "7000000001",
+          messaging: [{
+            sender: { id: "customer_88" },
+            recipient: { id: "7000000001" },
+            message: { mid: "mid_e2e_07", text: "help me please" },
+          }],
+        }],
+      })
+      const dmRes = await instagramWebhook.POST(dmReq)
+      assert.strictEqual(dmRes.status, 200)
+      assert.ok(capturedRequests.some((r) => r.url.includes("me/messages")))
+    })
+  })
+
   // =========================================================================
   // SECTION E: UI REGRESSION TESTS (PostSelector State & Lifecycle)
   // =========================================================================
@@ -1179,7 +1716,7 @@ describe("Security Test Suite — Phase 1 Remediation", () => {
         const props = {
           userId: "test_user_empty",
           selectedMediaId: null,
-          onSelect: () => {},
+          onSelect: () => { },
         }
 
         let tree = harness.runRender(props)
@@ -1210,7 +1747,7 @@ describe("Security Test Suite — Phase 1 Remediation", () => {
         const props = {
           userId: "test_user_err",
           selectedMediaId: null,
-          onSelect: () => {},
+          onSelect: () => { },
         }
 
         let tree = harness.runRender(props)
