@@ -21,6 +21,27 @@ import { getSupabaseAdmin } from "./supabase-admin"
 const UNLOCK_TTL_MS = 24 * 60 * 60 * 1000
 const supabaseLazy = () => getSupabaseAdmin()
 
+function sanitizeDbCode(code: unknown): string {
+  if (typeof code === "string" && (/^[A-Z0-9]{5}$/i.test(code) || /^PGRST\d{3}$/i.test(code))) {
+    return code.toUpperCase()
+  }
+  return "unknown_code"
+}
+
+function sanitizeErrorCategory(err: unknown): "timeout" | "network_error" | "error" | "unknown_error" {
+  if (err instanceof Error) {
+    if (err.name === "AbortError" || err.name === "TimeoutError") return "timeout"
+    if (
+      err.name === "FetchError" ||
+      (err.name === "TypeError" && err.message.toLowerCase().includes("fetch failed") && (err as any).cause != null)
+    ) {
+      return "network_error"
+    }
+    return "error"
+  }
+  return "unknown_error"
+}
+
 export function unlockKey(senderId: string, ruleId: string): string {
   return `${senderId}::${ruleId}`
 }
@@ -47,16 +68,16 @@ export async function bumpUnlockAttempt(key: string): Promise<number> {
       p_key: key,
     } as any)
     if (error) {
-      console.warn(`[unlock-tracking] bump_unlock_attempt RPC failed for key=${key}: ${error.message}`)
+      console.warn(`[unlock-tracking] bump_unlock_attempt RPC failed: code=${sanitizeDbCode((error as any)?.code)}`)
       return 1
     }
     if (typeof data !== "number") {
-      console.warn(`[unlock-tracking] bump_unlock_attempt returned non-number for key=${key}: ${JSON.stringify(data)}`)
+      console.warn("[unlock-tracking] bump_unlock_attempt returned non-number payload")
       return 1
     }
     return data
   } catch (e) {
-    console.warn(`[unlock-tracking] bump_unlock_attempt threw for key=${key}:`, e instanceof Error ? e.message : e)
+    console.warn(`[unlock-tracking] bump_unlock_attempt threw: category=${sanitizeErrorCategory(e)}`)
     return 1
   }
 }

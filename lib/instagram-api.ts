@@ -1,5 +1,26 @@
 const GRAPH = "https://graph.instagram.com/v24.0"
 
+function sanitizeHttpStatus(status: unknown): number | "unknown_status" {
+  if (typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599) {
+    return status
+  }
+  return "unknown_status"
+}
+
+function sanitizeErrorCategory(err: unknown): "timeout" | "network_error" | "error" | "unknown_error" {
+  if (err instanceof Error) {
+    if (err.name === "AbortError" || err.name === "TimeoutError") return "timeout"
+    if (
+      err.name === "FetchError" ||
+      (err.name === "TypeError" && err.message.toLowerCase().includes("fetch failed") && (err as any).cause != null)
+    ) {
+      return "network_error"
+    }
+    return "error"
+  }
+  return "unknown_error"
+}
+
 export interface IGButton {
   type: "web_url" | "postback"
   title: string
@@ -35,12 +56,12 @@ async function post(path: string, token: string, body: any): Promise<SendResult>
     })
     const json = await res.json()
     if (!res.ok || json.error) {
-      console.error(`[ig-api] ${path} failed:`, JSON.stringify(json.error))
+      console.error(`[ig-api] Request failed: status=${sanitizeHttpStatus(res.status)}`)
       return { ok: false, error: json.error || `HTTP ${res.status}` }
     }
     return { ok: true, id: json.id || json.message_id }
   } catch (e) {
-    console.error(`[ig-api] ${path} network error:`, e)
+    console.error(`[ig-api] Request error: category=${sanitizeErrorCategory(e)}`)
     return { ok: false, error: e }
   }
 }

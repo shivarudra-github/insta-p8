@@ -1,5 +1,26 @@
 import { validateAiBaseUrl } from "@/lib/ai-validation"
 
+function sanitizeHttpStatus(status: unknown): number | "unknown_status" {
+  if (typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599) {
+    return status
+  }
+  return "unknown_status"
+}
+
+function sanitizeErrorCategory(err: unknown): "timeout" | "network_error" | "error" | "unknown_error" {
+  if (err instanceof Error) {
+    if (err.name === "AbortError" || err.name === "TimeoutError") return "timeout"
+    if (
+      err.name === "FetchError" ||
+      (err.name === "TypeError" && err.message.toLowerCase().includes("fetch failed") && (err as any).cause != null)
+    ) {
+      return "network_error"
+    }
+    return "error"
+  }
+  return "unknown_error"
+}
+
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 const OPENAI_URL = "https://api.openai.com/v1/chat/completions"
 
@@ -37,7 +58,7 @@ function resolveSafeEndpoint(
       return { endpoint, apiKey, model }
     }
 
-    console.warn(`[ai-reply] SECURITY ALERT: Blocked unapproved AI base URL '${userBaseUrl}'. Attempting safe fallback.`)
+    console.warn("[ai-reply] SECURITY ALERT: Blocked unapproved AI base URL. Attempting safe fallback.")
   }
 
   // 2. Safe Fallback Provider: Verify fallback key and URL before dispatching
@@ -100,15 +121,15 @@ export async function generateAIReply(
     })
 
     if (!res.ok) {
-      const errText = await res.text()
-      console.error("[ai-reply] API error", res.status, errText.slice(0, 200))
+      await res.text()
+      console.error(`[ai-reply] API error: status=${sanitizeHttpStatus(res.status)}`)
       return null
     }
 
     const data = await res.json()
     return data.choices?.[0]?.message?.content?.trim() || null
   } catch (e) {
-    console.error("[ai-reply] fetch error", e)
+    console.error(`[ai-reply] Request error: category=${sanitizeErrorCategory(e)}`)
     return null
   }
 }

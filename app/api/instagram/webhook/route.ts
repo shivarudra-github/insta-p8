@@ -42,6 +42,37 @@ const DEFAULT_PUBLIC_REPLIES = ["Check your DMs! 📥", "Sent! 🔥", "Check inb
 const UNLOCK_GATE_MAX_ATTEMPTS = 3
 
 // ============================================================
+// Safe Logging Sanitization Helpers
+// ============================================================
+function sanitizeDbCode(code: unknown): string {
+  if (typeof code === "string" && (/^[A-Z0-9]{5}$/i.test(code) || /^PGRST\d{3}$/i.test(code))) {
+    return code.toUpperCase()
+  }
+  return "unknown_code"
+}
+
+function sanitizeErrorCategory(err: unknown): "timeout" | "network_error" | "error" | "unknown_error" {
+  if (err instanceof Error) {
+    if (err.name === "AbortError" || err.name === "TimeoutError") return "timeout"
+    if (
+      err.name === "FetchError" ||
+      (err.name === "TypeError" && err.message.toLowerCase().includes("fetch failed") && (err as any).cause != null)
+    ) {
+      return "network_error"
+    }
+    return "error"
+  }
+  return "unknown_error"
+}
+
+function sanitizeHttpStatus(status: unknown): number | "unknown_status" {
+  if (typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599) {
+    return status
+  }
+  return "unknown_status"
+}
+
+// ============================================================
 // Webhook Idempotency & Deduplication Helpers
 // ============================================================
 function createEventClaimId(eventKey: string): string {
@@ -69,7 +100,7 @@ async function claimWebhookEvent(
     }
     return { claimed: true, claimId }
   } catch (err) {
-    console.error("[webhook] Error claiming webhook event:", err)
+    console.error(`[webhook] Database error claiming webhook event: code=${sanitizeDbCode((err as any)?.code)} category=${sanitizeErrorCategory(err)}`)
     return { claimed: false, claimId }
   }
 }
@@ -78,7 +109,7 @@ async function releaseWebhookEventClaim(supabase: any, claimId: string): Promise
   try {
     await supabase.from("webhook_events").delete().eq("id", claimId)
   } catch (err) {
-    console.error("[webhook] Error releasing webhook event claim:", err)
+    console.error(`[webhook] Database error releasing webhook event claim: code=${sanitizeDbCode((err as any)?.code)} category=${sanitizeErrorCategory(err)}`)
   }
 }
 
@@ -88,12 +119,10 @@ export async function GET(request: NextRequest) {
   const token = searchParams.get("hub.verify_token")
   const challenge = searchParams.get("hub.challenge")
 console.info("[webhook verify diagnostic]", {
-  mode,
+  mode: mode === "subscribe" ? "subscribe" : "other",
   hasExpectedToken: Boolean(WEBHOOK_VERIFY_TOKEN),
   hasReceivedToken: Boolean(token),
-  tokenMatches: Boolean(
-    WEBHOOK_VERIFY_TOKEN && token === WEBHOOK_VERIFY_TOKEN
-  ),
+  tokenMatches: Boolean(WEBHOOK_VERIFY_TOKEN && token === WEBHOOK_VERIFY_TOKEN),
   challengePresent: Boolean(challenge),
 })
   if (mode === "subscribe" && WEBHOOK_VERIFY_TOKEN && token === WEBHOOK_VERIFY_TOKEN && challenge) {
@@ -197,8 +226,8 @@ async function verifyFollowStatus(igScopedId: string, pageAccessToken: string): 
     // 5s timeout -- Graph API is fast, anything longer means trouble
     const response = await fetch(url, { signal: AbortSignal.timeout(5000) })
     if (!response.ok) {
-      const errorText = await response.text()
-      console.error(`[webhook] Follow status check failed: ${response.status} ${errorText}`)
+      await response.text()
+      console.error(`[webhook] Follow status check failed: status=${sanitizeHttpStatus(response.status)}`)
       // Distinguish auth failures (fail closed) from transient (fail open)
       if (response.status === 401 || response.status === 403) {
         return { follows: null, error: 'auth' }
@@ -208,10 +237,10 @@ async function verifyFollowStatus(igScopedId: string, pageAccessToken: string): 
     }
     const data = await response.json()
     const follows = data.is_user_follow_business === true
-    console.log(`[webhook] Follow check for ${igScopedId}: is_user_follow_business=${data.is_user_follow_business} => ${follows ? "FOLLOWS" : "NOT FOLLOWING"}`)
+    console.log(`[webhook] Follow check completed: follows=${follows ? "true" : "false"}`)
     return { follows, error: undefined }
   } catch (error: any) {
-    console.error("[webhook] Error checking follow status:", error)
+    console.error(`[webhook] Error checking follow status: category=${sanitizeErrorCategory(error)}`)
     // AbortSignal.timeout throws AbortError/TimeoutError -- both are transient
     if (error?.name === "AbortError" || error?.name === "TimeoutError") {
       return { follows: null, error: 'transient' }
@@ -229,14 +258,8 @@ export async function POST(request: NextRequest) {
     const rawBody = await request.text()
     const signature = request.headers.get("x-hub-signature-256")
     if (!isValidSignature(rawBody, signature)) {
-      // Hash prefixes are safe to log and let us tell a wrong secret from a mutated body.
-      const computed = APP_SECRETS.map(
-        (s, i) =>
-          `${i === 0 ? "IG" : "META"}:${crypto.createHmac("sha256", s).update(rawBody, "utf8").digest("hex").slice(0, 12)}`,
-      ).join(" ")
       console.error(
-        `[webhook] 401: ${!signature ? "no x-hub-signature-256 header" : "signature mismatch"}; ` +
-          `secrets configured: ${APP_SECRETS.length}; received=${signature?.slice(7, 19) ?? "-"} computed=[${computed}] bodyLen=${rawBody.length}`,
+        `[webhook] 401: ${!signature ? "no x-hub-signature-256 header" : "signature verification failed"}`,
       )
       if (process.env.NODE_ENV !== "production" && process.env.DISABLE_WEBHOOK_SIGNATURE_CHECK === "true") {
         console.warn("[webhook] SIGNATURE CHECK BYPASSED — remove DISABLE_WEBHOOK_SIGNATURE_CHECK after debugging")
@@ -259,7 +282,7 @@ export async function POST(request: NextRequest) {
 
       const webhookId = entry.id
       if (typeof webhookId !== "string" || !/^\d+$/.test(webhookId)) {
-        console.warn(`[webhook] Invalid or malformed entry.id: ${JSON.stringify(webhookId)}`)
+        console.warn("[webhook] Invalid or malformed entry.id in payload")
         continue
       }
 
@@ -299,7 +322,7 @@ export async function POST(request: NextRequest) {
       }
 
       if (!user) {
-        console.log(`[webhook] ❌ Could not resolve user for ID ${webhookId}`)
+        console.log("[webhook] ❌ Could not resolve user for account ID")
         continue
       }
 
@@ -375,12 +398,12 @@ export async function POST(request: NextRequest) {
               { comment_id: commentId, media_id: mediaId, rule_id: match.id },
             )
             if (!claimResult.claimed) {
-              console.log(`[webhook] ⏭️ Duplicate comment skipped: ${commentId}`)
+              console.log("[webhook] ⏭️ Duplicate comment skipped")
               continue
             }
             claimId = claimResult.claimId
 
-            console.log(`[webhook] ✅ Comment match: "${match.name}"`)
+            console.log("[webhook] ✅ Comment rule matched")
 
             // reply_mode: 'both' (default) | 'dm_only' | 'public_only'
             const replyMode = content.reply_mode || "both"
@@ -404,7 +427,7 @@ export async function POST(request: NextRequest) {
               const followResult = await verifyFollowStatus(senderId, user.access_token)
 
               if (followResult.follows === true) {
-                console.log(`[webhook] ✅ Comment follower gate: @${senderId} follows @${user.username} — sending content`)
+                console.log("[webhook] ✅ Comment follower gate: follower verified — sending content")
                 if (replyMode !== "dm_only") {
                   const res = await replyToComment(user.access_token, commentId, getPublicReply())
                   if (!res?.ok) sendSucceeded = false
@@ -419,7 +442,7 @@ export async function POST(request: NextRequest) {
                   if (!res?.ok) sendSucceeded = false
                 }
               } else if (followResult.follows === false) {
-                console.log(`[webhook] 🔒 Comment follower gate: @${senderId} doesn't follow @${user.username}`)
+                console.log("[webhook] 🔒 Comment follower gate: non-follower detected")
                 if (replyMode !== "dm_only") {
                   const res = await replyToComment(user.access_token, commentId, getPublicReply())
                   if (!res?.ok) sendSucceeded = false
@@ -437,7 +460,7 @@ export async function POST(request: NextRequest) {
                 const isAuthError = followResult.error === 'auth'
                 if (isAuthError) {
                   // Auth/permission failure — fail CLOSED: send gate card
-                  console.warn(`[webhook] ⚠️ Comment follower gate auth failure for @${senderId}; sending gate`)
+                  console.warn("[webhook] ⚠️ Comment follower gate auth failure; sending gate")
                   if (replyMode !== "dm_only") {
                     const res = await replyToComment(user.access_token, commentId, getPublicReply())
                     if (!res?.ok) sendSucceeded = false
@@ -452,7 +475,7 @@ export async function POST(request: NextRequest) {
                   }
                 } else {
                   // Transient failure — fail OPEN: deliver content (with public reply if allowed)
-                  console.warn(`[webhook] ⚠️ Comment follower gate transient failure for @${senderId}; failing open`)
+                  console.warn("[webhook] ⚠️ Comment follower gate transient failure; failing open")
                   if (replyMode !== "dm_only") {
                     const res = await replyToComment(user.access_token, commentId, getPublicReply())
                     if (!res?.ok) sendSucceeded = false
@@ -486,11 +509,11 @@ export async function POST(request: NextRequest) {
             }
 
             if (!sendSucceeded && claimId) {
-              console.warn(`[webhook] Comment reply failed for ${commentId}, releasing claim for retry`)
+              console.warn("[webhook] Comment reply failed, releasing claim for retry")
               await releaseWebhookEventClaim(supabase, claimId)
             }
           } catch (commentErr) {
-            console.error("[webhook] Error processing comment change:", commentErr)
+            console.error(`[webhook] Error processing comment change: category=${sanitizeErrorCategory(commentErr)}`)
             if (claimId) {
               await releaseWebhookEventClaim(supabase, claimId)
             }
@@ -555,28 +578,28 @@ export async function POST(request: NextRequest) {
             }
 
             if (match) {
-              console.log(`[webhook] ✨ Story match: "${match.name}"`)
+              console.log("[webhook] ✨ Story rule matched")
               const content = parseContent(match.response_content)
 
               if (content.check_follow === true) {
                 const followResult = await verifyFollowStatus(senderId, user.access_token)
 
                 if (followResult.follows === true) {
-                  console.log(`[webhook] ✅ Story follower gate: @${senderId} follows @${user.username} — sending content`)
+                  console.log("[webhook] ✅ Story follower gate: follower verified — sending content")
                   await sendAutomationResponse(user.access_token, { id: senderId }, content)
                 } else if (followResult.follows === false) {
-                  console.log(`[webhook] 🔒 Story follower gate: @${senderId} doesn't follow @${user.username}`)
+                  console.log("[webhook] 🔒 Story follower gate: non-follower detected")
                   await sendCardDM(user.access_token, { id: senderId }, buildFollowGateCard({ username: user.username, ruleId: match.id }))
                 } else {
                   // null → unverifiable. Distinguish auth vs transient.
                   const isAuthError = followResult.error === 'auth'
                   if (isAuthError) {
                     // Auth failure — fail CLOSED: send gate
-                    console.warn(`[webhook] ⚠️ Story follower gate auth failure for @${senderId}; sending gate`)
+                    console.warn("[webhook] ⚠️ Story follower gate auth failure; sending gate")
                     await sendCardDM(user.access_token, { id: senderId }, buildFollowGateCard({ username: user.username, ruleId: match.id }))
                   } else {
                     // Transient failure — fail OPEN: deliver content
-                    console.warn(`[webhook] ⚠️ Story follower gate transient failure for @${senderId}; failing open`)
+                    console.warn("[webhook] ⚠️ Story follower gate transient failure; failing open")
                     await sendAutomationResponse(user.access_token, { id: senderId }, content)
                   }
                 }
@@ -586,7 +609,7 @@ export async function POST(request: NextRequest) {
               }
             }
           } catch (storyErr) {
-            console.error("[webhook] Error processing story event:", storyErr)
+            console.error(`[webhook] Error processing story event: category=${sanitizeErrorCategory(storyErr)}`)
           }
         }
       }
@@ -633,13 +656,13 @@ export async function POST(request: NextRequest) {
                 { mid, sender_id: senderId },
               )
               if (!claimResult.claimed) {
-                console.log(`[webhook] ⏭️ Duplicate DM event skipped: ${mid}`)
+                console.log("[webhook] ⏭️ Duplicate DM event skipped")
                 continue
               }
               claimId = claimResult.claimId
             }
 
-            console.log(`[webhook] 📩 DM from ${senderId}: "${triggerValue}"`)
+            console.log("[webhook] 📩 Incoming DM received")
 
           // Inbox bookkeeping runs alongside delivery, not ahead of it. Always
           // joined below so serverless shutdown cannot discard pending writes.
@@ -689,7 +712,7 @@ export async function POST(request: NextRequest) {
               })
             }
           } catch (err) {
-            console.error("[webhook] Failed to save incoming message", err)
+            console.error(`[webhook] Database error saving incoming message: code=${sanitizeDbCode((err as any)?.code)} category=${sanitizeErrorCategory(err)}`)
           }
           return conv
           })()
@@ -738,7 +761,7 @@ export async function POST(request: NextRequest) {
             if (!match) {
               // AI fallback: if no keyword rule matched, try AI auto-reply
               if (user.groq_auto_reply_enabled && triggerType !== "postback") {
-                console.log(`[webhook] 🤖 No rule match — trying AI auto-reply for DM from ${senderId}`)
+                console.log("[webhook] 🤖 No rule match — trying AI auto-reply for DM")
                 await sendSenderAction(user.access_token, senderId, "mark_seen")
                 const conv = await incomingSaved // AI needs history; keyword replies do not.
                 const { data: recentMessages } = conv
@@ -772,13 +795,13 @@ export async function POST(request: NextRequest) {
                         is_from_instagram: false,
                       })
                     } catch (e) {
-                      console.error("[webhook] Failed to save AI reply", e)
+                      console.error(`[webhook] Database error saving AI reply: code=${sanitizeDbCode((e as any)?.code)} category=${sanitizeErrorCategory(e)}`)
                     }
                   }
                 }
               }
               if (!sendSucceeded && claimId) {
-                console.warn(`[webhook] AI DM reply failed for ${mid}, releasing claim for retry`)
+                console.warn("[webhook] AI DM reply failed, releasing claim for retry")
                 await releaseWebhookEventClaim(supabase, claimId)
               }
               continue
@@ -786,7 +809,7 @@ export async function POST(request: NextRequest) {
 
                     if (!match) continue
 
-                    console.log(`[webhook] ✅ DM match: "${match.name}"`)
+                    console.log("[webhook] ✅ DM rule matched")
                     const content = parseContent(match.response_content)
 
                     // Mark message as seen for human-like flow
@@ -806,7 +829,7 @@ export async function POST(request: NextRequest) {
 
                         if (followResult.follows === true) {
                           await clearUnlockAttempts(attemptKey)
-                          console.log(`[webhook] ✅ DM unlock verified for @${senderId}`)
+                          console.log("[webhook] ✅ DM unlock verified")
                           const result = await sendAutomationResponse(user.access_token, { id: senderId }, content)
                           if (!result?.ok) sendSucceeded = false
                           const conv = await incomingSaved
@@ -822,12 +845,12 @@ export async function POST(request: NextRequest) {
                                 is_from_instagram: false,
                               })
                             } catch (e) {
-                              console.error("[webhook] Failed to save outgoing message", e)
+                              console.error(`[webhook] Database error saving outgoing message: code=${sanitizeDbCode((e as any)?.code)} category=${sanitizeErrorCategory(e)}`)
                             }
                           }
                         } else if (followResult.follows === false) {
                           await clearUnlockAttempts(attemptKey)
-                          console.log(`[webhook] ❌ DM unlock rejected: @${senderId} still doesn't follow`)
+                          console.log("[webhook] ❌ DM unlock rejected: follower check returned false")
                           const result = await sendCardDM(user.access_token, { id: senderId }, buildFollowGateCard({ username: user.username, ruleId: match.id, title: "❌ Not Following Yet!", subtitle: `We couldn't verify your follow. Please follow @${user.username} and click the button again.` }))
                           if (!result?.ok) sendSucceeded = false
                           const conv = await incomingSaved
@@ -843,7 +866,7 @@ export async function POST(request: NextRequest) {
                                 is_from_instagram: false,
                               })
                             } catch (e) {
-                              console.error("[webhook] Failed to save outgoing message", e)
+                              console.error(`[webhook] Database error saving outgoing message: code=${sanitizeDbCode((e as any)?.code)} category=${sanitizeErrorCategory(e)}`)
                             }
                           }
                         } else {
@@ -851,7 +874,8 @@ export async function POST(request: NextRequest) {
                                                   const attempts = await bumpUnlockAttempt(attemptKey)
                                                   if (attempts > UNLOCK_GATE_MAX_ATTEMPTS) {
                                                     await clearUnlockAttempts(attemptKey)
-                                                    console.warn(`[webhook] ⚠️ DM unlock gate capped after ${attempts} unverifiable attempts for @${senderId} / rule ${match.id}`)
+                                                    const safeAttempts = typeof attempts === "number" && Number.isInteger(attempts) && attempts > 0 ? attempts : "unknown"
+                                                    console.warn(`[webhook] ⚠️ DM unlock gate capped after ${safeAttempts} unverifiable attempts`)
                                                     const result = await sendTextDM(
                                                       user.access_token,
                                                       { id: senderId },
@@ -871,11 +895,12 @@ export async function POST(request: NextRequest) {
                                                           is_from_instagram: false,
                                                         })
                                                       } catch (e) {
-                                                        console.error("[webhook] Failed to save outgoing message", e)
+                                                        console.error(`[webhook] Database error saving outgoing message: code=${sanitizeDbCode((e as any)?.code)} category=${sanitizeErrorCategory(e)}`)
                                                       }
                                                     }
                                                   } else {
-                                                    console.warn(`[webhook] ⚠️ DM unlock unverifiable (attempt ${attempts}/${UNLOCK_GATE_MAX_ATTEMPTS}) for @${senderId}`)
+                                                    const safeAttempts = typeof attempts === "number" && Number.isInteger(attempts) && attempts > 0 ? attempts : "unknown"
+                                                    console.warn(`[webhook] ⚠️ DM unlock unverifiable (attempt ${safeAttempts}/${UNLOCK_GATE_MAX_ATTEMPTS})`)
                                                     const result = await sendCardDM(user.access_token, { id: senderId }, buildFollowGateCard({ username: user.username, ruleId: match.id, subtitle: `Please follow @${user.username} to see this!` }))
                                                     if (!result?.ok) sendSucceeded = false
                                                     const conv = await incomingSaved
@@ -891,7 +916,7 @@ export async function POST(request: NextRequest) {
                                                           is_from_instagram: false,
                                                         })
                                                       } catch (e) {
-                                                        console.error("[webhook] Failed to save outgoing message", e)
+                                                        console.error(`[webhook] Database error saving outgoing message: code=${sanitizeDbCode((e as any)?.code)} category=${sanitizeErrorCategory(e)}`)
                                                       }
                                                     }
                                                   }
@@ -902,7 +927,7 @@ export async function POST(request: NextRequest) {
 
                                                 if (followResult.follows === true) {
                           await clearUnlockAttempts(attemptKey)
-                          console.log(`[webhook] ✅ DM follower gate: @${senderId} follows @${user.username} — sending content`)
+                          console.log("[webhook] ✅ DM follower gate: follower verified — sending content")
                           const result = await sendAutomationResponse(user.access_token, { id: senderId }, content)
                           if (!result?.ok) sendSucceeded = false
                           const conv = await incomingSaved
@@ -918,12 +943,12 @@ export async function POST(request: NextRequest) {
                                 is_from_instagram: false,
                               })
                             } catch (e) {
-                              console.error("[webhook] Failed to save outgoing message", e)
+                              console.error(`[webhook] Database error saving outgoing message: code=${sanitizeDbCode((e as any)?.code)} category=${sanitizeErrorCategory(e)}`)
                             }
                           }
                         } else if (followResult.follows === false) {
                           await clearUnlockAttempts(attemptKey)
-                          console.log(`[webhook] 🔒 DM follower gate: @${senderId} doesn't follow @${user.username}`)
+                          console.log("[webhook] 🔒 DM follower gate: non-follower detected")
                           const result = await sendCardDM(user.access_token, { id: senderId }, buildFollowGateCard({ username: user.username, ruleId: match.id, subtitle: `Please follow @${user.username} to see this!` }))
                           if (!result?.ok) sendSucceeded = false
                           const conv = await incomingSaved
@@ -939,7 +964,7 @@ export async function POST(request: NextRequest) {
                                 is_from_instagram: false,
                               })
                             } catch (e) {
-                              console.error("[webhook] Failed to save outgoing message", e)
+                              console.error(`[webhook] Database error saving outgoing message: code=${sanitizeDbCode((e as any)?.code)} category=${sanitizeErrorCategory(e)}`)
                             }
                           }
                         } else {
@@ -948,7 +973,7 @@ export async function POST(request: NextRequest) {
                           // Only transient 5xx/timeouts fail OPEN and deliver content.
                           const isAuthError = followResult.error === 'auth'
                           if (isAuthError) {
-                            console.warn(`[webhook] ⚠️ DM follower gate auth failure for @${senderId}; sending gate`)
+                            console.warn("[webhook] ⚠️ DM follower gate auth failure; sending gate")
                             const result = await sendCardDM(user.access_token, { id: senderId }, buildFollowGateCard({ username: user.username, ruleId: match.id, title: "❌ Verification Failed", subtitle: `We can't verify your follow status. Please follow @${user.username} and try again.` }))
                             if (!result?.ok) sendSucceeded = false
                             const conv = await incomingSaved
@@ -964,12 +989,12 @@ export async function POST(request: NextRequest) {
                                   is_from_instagram: false,
                                 })
                               } catch (e) {
-                                console.error("[webhook] Failed to save outgoing message", e)
+                                console.error(`[webhook] Database error saving outgoing message: code=${sanitizeDbCode((e as any)?.code)} category=${sanitizeErrorCategory(e)}`)
                               }
                             }
                           } else {
                             // Transient failure — fail OPEN on initial trigger
-                            console.warn(`[webhook] ⚠️ DM follower gate transient failure for @${senderId}; failing open on initial trigger`)
+                            console.warn("[webhook] ⚠️ DM follower gate transient failure; failing open on initial trigger")
                             const result = await sendAutomationResponse(user.access_token, { id: senderId }, content)
                             if (!result?.ok) sendSucceeded = false
                             const conv = await incomingSaved
@@ -985,7 +1010,7 @@ export async function POST(request: NextRequest) {
                                   is_from_instagram: false,
                                 })
                               } catch (e) {
-                                console.error("[webhook] Failed to save outgoing message", e)
+                                console.error(`[webhook] Database error saving outgoing message: code=${sanitizeDbCode((e as any)?.code)} category=${sanitizeErrorCategory(e)}`)
                               }
                             }
                           }
@@ -1008,20 +1033,20 @@ export async function POST(request: NextRequest) {
                             is_from_instagram: false,
                           })
                         } catch (e) {
-                          console.error("[webhook] Failed to save outgoing message", e)
+                          console.error(`[webhook] Database error saving outgoing message: code=${sanitizeDbCode((e as any)?.code)} category=${sanitizeErrorCategory(e)}`)
                         }
                       }
                     }
 
               if (!sendSucceeded && claimId) {
-                console.warn(`[webhook] DM reply failed for ${mid}, releasing claim for retry`)
+                console.warn("[webhook] DM reply failed, releasing claim for retry")
                 await releaseWebhookEventClaim(supabase, claimId)
               }
             } finally {
               await incomingSaved
             }
           } catch (dmErr) {
-            console.error("[webhook] Error processing DM event:", dmErr)
+            console.error(`[webhook] Error processing DM event: category=${sanitizeErrorCategory(dmErr)}`)
             if (claimId) {
               await releaseWebhookEventClaim(supabase, claimId)
             }
@@ -1031,7 +1056,7 @@ export async function POST(request: NextRequest) {
     }
     return NextResponse.json({ ok: true })
   } catch (error) {
-    console.error("[webhook] Error", error)
+    console.error(`[webhook] Top-level handler error: category=${sanitizeErrorCategory(error)}`)
     return NextResponse.json({ ok: true })
   }
 }
