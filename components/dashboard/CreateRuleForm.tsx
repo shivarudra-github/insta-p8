@@ -248,7 +248,7 @@ export function CreateRuleForm({ userId, triggerSource, onSuccess, editRule }: C
         body: JSON.stringify(isEditing ? { ...payload, id: editRule!.id } : payload),
       })
       if (res.ok) {
-        toast.success(isEditing ? "Automation updated" : "Automation is live")
+        toast.success(isEditing ? "Automation updated" : "Automation saved and paused")
         onSuccess()
       } else {
         toast.error("Could not save — try again")
