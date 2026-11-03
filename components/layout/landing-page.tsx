@@ -1,6 +1,7 @@
 "use client"
 
 import { useEffect, useState } from "react"
+import Link from "next/link"
 import { useRouter } from "next/navigation"
 import {
   Zap, MessageCircle, Sparkles, ArrowUpRight, Github, Star,
@@ -248,9 +249,13 @@ export function LandingPage() {
       {/* Footer */}
       <footer className="border-t border-white/[0.08] px-5 md:px-10 py-8 flex flex-col md:flex-row items-center justify-between gap-4">
         <span className="font-mono-ui text-[11px] text-neutral-600">
-          insta-p8 — open-source Instagram automation. MIT licensed.
+          AutoReply Studio — Instagram Automation
         </span>
-        <div className="flex items-center gap-5 font-mono-ui text-[11px] text-neutral-500">
+        <div className="flex flex-wrap items-center gap-5 font-mono-ui text-[11px] text-neutral-500">
+          <Link href="/privacy" className="hover:text-white transition-colors">Privacy Policy</Link>
+          <Link href="/terms" className="hover:text-white transition-colors">Terms of Service</Link>
+          <Link href="/data-deletion" className="hover:text-white transition-colors">Data Deletion</Link>
+          <span className="text-neutral-700">|</span>
           <a href={GITHUB_URL} target="_blank" rel="noreferrer" className="hover:text-white transition-colors">GitHub</a>
           <a href={TELEGRAM_URL} target="_blank" rel="noreferrer" className="hover:text-[#2AABEE] transition-colors">Telegram support</a>
         </div>
