@@ -3328,7 +3328,7 @@ describe("Security Test Suite — Phase 1 Remediation", () => {
   // SECTION: CENTRAL SESSION REVOCATION REMEDIATION
   // =========================================================================
   describe("[REMEDIATION] Central Session Revocation (lib/auth-session.ts)", () => {
-    const VALID_USER_ID = "user_revocation_test"
+    const VALID_USER_ID = "10001"
     let validToken
 
     beforeEach(() => {
@@ -3428,9 +3428,9 @@ describe("Security Test Suite — Phase 1 Remediation", () => {
 
     it("SESSION-REVOCATION-08: User existence lookup uses the verified session ID, never a request-supplied ID", async () => {
       mockStore.users.push({ id: VALID_USER_ID, username: "revocation_tester" })
-      mockStore.users.push({ id: "attacker_injected_id", username: "attacker" })
+      mockStore.users.push({ id: "99999", username: "attacker" })
 
-      const req = new NextRequest("http://localhost:3000/api/auth/me?userId=attacker_injected_id", {
+      const req = new NextRequest("http://localhost:3000/api/auth/me?userId=99999", {
         headers: { Cookie: `insta_session=${validToken}` },
       })
       const auth = await authenticateRequest(req)
