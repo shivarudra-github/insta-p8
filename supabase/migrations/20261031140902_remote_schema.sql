@@ -504,3 +504,46 @@ GRANT DELETE, INSERT, MAINTAIN, REFERENCES, SELECT, TRIGGER, TRUNCATE, UPDATE ON
 
 GRANT DELETE, INSERT, MAINTAIN, REFERENCES, SELECT, TRIGGER, TRUNCATE, UPDATE ON TABLE "public"."webhook_events" TO "service_role";
 
+-- =========================================================================
+-- V6 Pre-staging remediation: revoke unnecessary table privileges from
+-- anon/authenticated (least privilege). Idempotent: REVOKE is a no-op when
+-- the privilege is not held.
+-- =========================================================================
+
+-- TRUNCATE, REFERENCES and TRIGGER are dangerous DDL-adjacent privileges that
+-- anon/authenticated should not hold on application tables. These privilege
+-- names exist in all supported PostgreSQL versions, so the revoke is unconditional.
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON TABLE "public"."automations" FROM "anon", "authenticated";
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON TABLE "public"."content_pool" FROM "anon", "authenticated";
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON TABLE "public"."conversations" FROM "anon", "authenticated";
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON TABLE "public"."dm_queue" FROM "anon", "authenticated";
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON TABLE "public"."ice_breakers" FROM "anon", "authenticated";
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON TABLE "public"."media_cache" FROM "anon", "authenticated";
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON TABLE "public"."messages" FROM "anon", "authenticated";
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON TABLE "public"."reels_posts" FROM "anon", "authenticated";
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON TABLE "public"."scheduler_config" FROM "anon", "authenticated";
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON TABLE "public"."unlock_attempts" FROM "anon", "authenticated";
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON TABLE "public"."users" FROM "anon", "authenticated";
+REVOKE TRUNCATE, REFERENCES, TRIGGER ON TABLE "public"."webhook_events" FROM "anon", "authenticated";
+
+-- MAINTAIN (table maintenance: VACUUM, ANALYZE, etc.) was introduced in
+-- PostgreSQL 14. Guard the revoke so the migration stays valid on older
+-- servers that do not recognise the MAINTAIN privilege keyword.
+DO $$
+BEGIN
+  IF (SELECT current_setting('server_version_num')::int) >= 140000 THEN
+    REVOKE MAINTAIN ON TABLE "public"."automations" FROM "anon", "authenticated";
+    REVOKE MAINTAIN ON TABLE "public"."content_pool" FROM "anon", "authenticated";
+    REVOKE MAINTAIN ON TABLE "public"."conversations" FROM "anon", "authenticated";
+    REVOKE MAINTAIN ON TABLE "public"."dm_queue" FROM "anon", "authenticated";
+    REVOKE MAINTAIN ON TABLE "public"."ice_breakers" FROM "anon", "authenticated";
+    REVOKE MAINTAIN ON TABLE "public"."media_cache" FROM "anon", "authenticated";
+    REVOKE MAINTAIN ON TABLE "public"."messages" FROM "anon", "authenticated";
+    REVOKE MAINTAIN ON TABLE "public"."reels_posts" FROM "anon", "authenticated";
+    REVOKE MAINTAIN ON TABLE "public"."scheduler_config" FROM "anon", "authenticated";
+    REVOKE MAINTAIN ON TABLE "public"."unlock_attempts" FROM "anon", "authenticated";
+    REVOKE MAINTAIN ON TABLE "public"."users" FROM "anon", "authenticated";
+    REVOKE MAINTAIN ON TABLE "public"."webhook_events" FROM "anon", "authenticated";
+  END IF;
+END $$;
+

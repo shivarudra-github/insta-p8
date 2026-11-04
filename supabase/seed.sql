@@ -1,0 +1,3 @@
+-- InstaAuto seed file (placeholder)
+-- Intentionally empty: no seed data is loaded on db reset.
+-- Add seed statements here only when a reviewed seed dataset is required.
