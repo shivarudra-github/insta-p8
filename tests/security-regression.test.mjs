@@ -26,6 +26,7 @@ import { validateAiBaseUrl } from "../lib/ai-validation.ts"
 
 // Actual Route Handlers (tested with NextRequest)
 import * as authMe from "../app/api/auth/me/route.ts"
+import { authenticateRequest } from "../lib/auth-session.ts"
 import * as authLogout from "../app/api/auth/logout/route.ts"
 import * as automations from "../app/api/automations/route.ts"
 import * as businessProfile from "../app/api/business-profile/route.ts"
@@ -297,6 +298,7 @@ describe("Security Test Suite — Phase 1 Remediation", () => {
 
     it("ROUTE-AUTH-15: GET /api/auth/me with valid session cookie -> 200", async () => {
       const validToken = createSessionToken({ userId: "alice_1", username: "alice" })
+      mockStore.users.push({ id: "alice_1", username: "alice" })
       const req = new NextRequest("http://localhost:3000/api/auth/me", {
         headers: { Cookie: `insta_session=${validToken}` },
       })
@@ -317,6 +319,7 @@ describe("Security Test Suite — Phase 1 Remediation", () => {
     beforeEach(() => {
       resetMockStore()
       aliceToken = createSessionToken({ userId: ALICE_ID, username: "alice" })
+      mockStore.users.push({ id: ALICE_ID, username: "alice" })
 
       // Seed mock database with Bob's data
       mockStore.automations.push({
@@ -1860,6 +1863,7 @@ describe("Security Test Suite — Phase 1 Remediation", () => {
     beforeEach(() => {
       resetMockStore()
       userToken = createSessionToken({ userId: TEST_USER, username: "ice_tester" })
+      mockStore.users.push({ id: TEST_USER, username: "ice_tester" })
     })
 
     it("ICE-01: Unauthenticated POST returns 401", async () => {
@@ -2792,4 +2796,666 @@ describe("Security Test Suite — Phase 1 Remediation", () => {
       }
     })
   })
+
+  // =========================================================================
+  // SECTION: OAUTH TOKEN LIFECYCLE REMEDIATION
+  // =========================================================================
+  describe("[REMEDIATION] OAuth Token Lifecycle (app/api/instagram/callback/route.ts)", () => {
+    const originalEnv = { ...process.env }
+    const originalFetch = global.fetch
+
+    beforeEach(() => {
+      resetMockStore()
+      process.env.INSTAGRAM_APP_ID = "test_app_123"
+      process.env.INSTAGRAM_APP_SECRET = "test_secret_456"
+      process.env.NEXT_PUBLIC_INSTAGRAM_REDIRECT_URI = "https://example.com/api/instagram/callback"
+    })
+
+    afterEach(() => {
+      process.env = { ...originalEnv }
+      global.fetch = originalFetch
+    })
+
+    function createCallbackRequest(state = "valid_state_nonce_123", code = "valid_auth_code_999") {
+      return new NextRequest(
+        `https://example.com/api/instagram/callback?code=${code}&state=${state}`,
+        {
+          headers: { Cookie: `oauth_state=${state}` },
+        }
+      )
+    }
+
+    it("OAUTH-LIFECYCLE-01: Successful long-lived exchange persists only the long-lived token", async () => {
+      global.fetch = async (url) => {
+        const urlStr = String(url)
+        if (urlStr.includes("api.instagram.com/oauth/access_token")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({ access_token: "short_lived_token_aaa", user_id: 88888 }),
+          }
+        }
+        if (urlStr.includes("graph.instagram.com/access_token")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({
+              access_token: "long_lived_token_bbb",
+              token_type: "bearer",
+              expires_in: 5184000,
+            }),
+          }
+        }
+        if (urlStr.includes("graph.instagram.com/v24.0/me")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ user_id: "88888", username: "creator_pro" }),
+          }
+        }
+        throw new Error(`Unexpected fetch URL: ${urlStr}`)
+      }
+
+      const req = createCallbackRequest()
+      const res = await instagramCallback.GET(req)
+      assert.strictEqual(res.status, 302)
+      assert.ok(res.headers.get("location")?.includes("/dashboard"))
+
+      const user = mockStore.users.find((u) => u.id === "88888")
+      assert.ok(user, "User must be upserted in database")
+      assert.strictEqual(user.access_token, "long_lived_token_bbb", "Must persist ONLY the long-lived token")
+      assert.notStrictEqual(user.access_token, "short_lived_token_aaa", "Must never persist short-lived token")
+
+      const setCookie = res.headers.get("set-cookie") || ""
+      assert.ok(setCookie.includes("insta_session="), "Must issue signed session cookie")
+      assert.ok(setCookie.includes("oauth_state="), "Must clear oauth_state cookie")
+      assert.ok(setCookie.includes("Max-Age=0"), "oauth_state must be expired")
+    })
+
+    it("OAUTH-LIFECYCLE-02: Long-lived exchange HTTP failure does not upsert user or issue session", async () => {
+      global.fetch = async (url) => {
+        const urlStr = String(url)
+        if (urlStr.includes("api.instagram.com/oauth/access_token")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({ access_token: "short_lived_token_aaa", user_id: 88888 }),
+          }
+        }
+        if (urlStr.includes("graph.instagram.com/access_token")) {
+          return {
+            ok: false,
+            status: 500,
+            text: async () => JSON.stringify({ error: { message: "Internal Graph API Error" } }),
+          }
+        }
+        throw new Error(`Unexpected fetch URL: ${urlStr}`)
+      }
+
+      const req = createCallbackRequest()
+      const res = await instagramCallback.GET(req)
+      assert.strictEqual(res.status, 302)
+      assert.ok(res.headers.get("location")?.includes("error=token_exchange_failed"))
+      assert.strictEqual(mockStore.users.length, 0, "Must not upsert user on failure")
+
+      const setCookie = res.headers.get("set-cookie") || ""
+      assert.strictEqual(setCookie.includes("insta_session="), false, "Must not issue session cookie")
+      assert.ok(setCookie.includes("oauth_state="), "Must clear oauth_state cookie")
+      assert.ok(setCookie.includes("Max-Age=0"), "oauth_state must be expired")
+    })
+
+    it("OAUTH-LIFECYCLE-03: Malformed/non-JSON exchange response fails closed", async () => {
+      global.fetch = async (url) => {
+        const urlStr = String(url)
+        if (urlStr.includes("api.instagram.com/oauth/access_token")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({ access_token: "short_lived_token_aaa", user_id: 88888 }),
+          }
+        }
+        if (urlStr.includes("graph.instagram.com/access_token")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => "<html>502 Bad Gateway - HTML error page</html>",
+          }
+        }
+        throw new Error(`Unexpected fetch URL: ${urlStr}`)
+      }
+
+      const req = createCallbackRequest()
+      const res = await instagramCallback.GET(req)
+      assert.strictEqual(res.status, 302)
+      assert.ok(res.headers.get("location")?.includes("error=token_exchange_failed"))
+      assert.strictEqual(mockStore.users.length, 0, "Must not upsert user on malformed response")
+
+      const setCookie = res.headers.get("set-cookie") || ""
+      assert.strictEqual(setCookie.includes("insta_session="), false, "Must not issue session cookie")
+    })
+
+    it("OAUTH-LIFECYCLE-04: Missing access_token fails closed", async () => {
+      global.fetch = async (url) => {
+        const urlStr = String(url)
+        if (urlStr.includes("api.instagram.com/oauth/access_token")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({ access_token: "short_lived_token_aaa", user_id: 88888 }),
+          }
+        }
+        if (urlStr.includes("graph.instagram.com/access_token")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({ expires_in: 5184000 }),
+          }
+        }
+        throw new Error(`Unexpected fetch URL: ${urlStr}`)
+      }
+
+      const req = createCallbackRequest()
+      const res = await instagramCallback.GET(req)
+      assert.strictEqual(res.status, 302)
+      assert.ok(res.headers.get("location")?.includes("error=token_exchange_failed"))
+      assert.strictEqual(mockStore.users.length, 0, "Must not upsert user when access_token is missing")
+    })
+
+    it("OAUTH-LIFECYCLE-05: Missing, zero, negative, non-integer or excessive expires_in fails closed", async () => {
+      const invalidExpiryValues = [
+        undefined,
+        0,
+        -60,
+        5184000.5,
+        "5184000",
+        5184001,
+      ]
+
+      for (const invalidVal of invalidExpiryValues) {
+        resetMockStore()
+        global.fetch = async (url) => {
+          const urlStr = String(url)
+          if (urlStr.includes("api.instagram.com/oauth/access_token")) {
+            return {
+              ok: true,
+              status: 200,
+              text: async () => JSON.stringify({ access_token: "short_token_1", user_id: 88888 }),
+            }
+          }
+          if (urlStr.includes("graph.instagram.com/access_token")) {
+            const bodyObj = { access_token: "long_token_1" }
+            if (invalidVal !== undefined) bodyObj.expires_in = invalidVal
+            return {
+              ok: true,
+              status: 200,
+              text: async () => JSON.stringify(bodyObj),
+            }
+          }
+          throw new Error(`Unexpected fetch URL: ${urlStr}`)
+        }
+
+        const req = createCallbackRequest()
+        const res = await instagramCallback.GET(req)
+        assert.strictEqual(res.status, 302)
+        assert.ok(res.headers.get("location")?.includes("error=token_exchange_failed"))
+        assert.strictEqual(mockStore.users.length, 0, `Must not upsert user for expires_in=${invalidVal}`)
+      }
+    })
+
+    it("OAUTH-LIFECYCLE-06: Thrown timeout/network error does not fall back to short-lived token", async () => {
+      global.fetch = async (url) => {
+        const urlStr = String(url)
+        if (urlStr.includes("api.instagram.com/oauth/access_token")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({ access_token: "short_lived_token_aaa", user_id: 88888 }),
+          }
+        }
+        if (urlStr.includes("graph.instagram.com/access_token")) {
+          const err = new Error("AbortError: The operation was aborted due to timeout")
+          err.name = "AbortError"
+          throw err
+        }
+        throw new Error(`Unexpected fetch URL: ${urlStr}`)
+      }
+
+      const req = createCallbackRequest()
+      const res = await instagramCallback.GET(req)
+      assert.strictEqual(res.status, 302)
+      assert.ok(
+        res.headers.get("location")?.includes("error=token_exchange_failed") ||
+        res.headers.get("location")?.includes("error=authentication_failed")
+      )
+      assert.strictEqual(mockStore.users.length, 0, "Must not upsert user on timeout")
+
+      const setCookie = res.headers.get("set-cookie") || ""
+      assert.strictEqual(setCookie.includes("insta_session="), false, "Must not issue session cookie on timeout")
+    })
+
+    it("OAUTH-LIFECYCLE-07: OAuth state cookie is cleared on failed token exchange", async () => {
+      global.fetch = async (url) => {
+        const urlStr = String(url)
+        if (urlStr.includes("api.instagram.com/oauth/access_token")) {
+          return {
+            ok: false,
+            status: 400,
+            text: async () => JSON.stringify({ error: { message: "Invalid code" } }),
+          }
+        }
+        throw new Error(`Unexpected fetch URL: ${urlStr}`)
+      }
+
+      const req = createCallbackRequest()
+      const res = await instagramCallback.GET(req)
+      assert.strictEqual(res.status, 302)
+
+      const setCookie = res.headers.get("set-cookie") || ""
+      assert.ok(setCookie.includes("oauth_state="), "Must set oauth_state deletion cookie")
+      assert.ok(setCookie.includes("Max-Age=0"), "oauth_state must have Max-Age=0")
+    })
+
+    it("OAUTH-LIFECYCLE-08: Failed /me profile request cannot cause access token or URL to be written to logs", async () => {
+      const sensitiveToken = "sensitive_secret_long_token_999_never_leak"
+      const originalConsoleError = console.error
+      const capturedLogs = []
+      console.error = (...args) => {
+        capturedLogs.push(args.join(" "))
+      }
+
+      try {
+        global.fetch = async (url) => {
+          const urlStr = String(url)
+          if (urlStr.includes("api.instagram.com/oauth/access_token")) {
+            return {
+              ok: true,
+              status: 200,
+              text: async () => JSON.stringify({ access_token: "short_lived_token_aaa", user_id: 88888 }),
+            }
+          }
+          if (urlStr.includes("graph.instagram.com/access_token")) {
+            return {
+              ok: true,
+              status: 200,
+              text: async () => JSON.stringify({
+                access_token: sensitiveToken,
+                token_type: "bearer",
+                expires_in: 5184000,
+              }),
+            }
+          }
+          if (urlStr.includes("graph.instagram.com/v24.0/me")) {
+            throw new Error(`Connection timeout requesting https://graph.instagram.com/v24.0/me?access_token=${sensitiveToken}`)
+          }
+          throw new Error(`Unexpected fetch URL: ${urlStr}`)
+        }
+
+        const req = createCallbackRequest()
+        const res = await instagramCallback.GET(req)
+        assert.strictEqual(res.status, 302)
+        assert.ok(res.headers.get("location")?.includes("/dashboard"))
+
+        const user = mockStore.users.find((u) => u.id === "88888")
+        assert.ok(user, "User must still be created with verified long-lived token")
+        assert.strictEqual(user.username, "user_88888", "Must fall back to default username")
+
+        const allLogs = capturedLogs.join("\n")
+        assert.strictEqual(
+          allLogs.includes(sensitiveToken),
+          false,
+          "Logs must NEVER contain the sensitive access token"
+        )
+        assert.strictEqual(
+          allLogs.includes("graph.instagram.com/v24.0/me"),
+          false,
+          "Logs must NEVER contain the full profile query URL"
+        )
+        assert.strictEqual(
+          allLogs.includes("Connection timeout requesting"),
+          false,
+          "Logs must NEVER contain the raw exception message"
+        )
+        assert.ok(
+          allLogs.includes("Profile fetch failed: category="),
+          "Logs must contain only the fixed, sanitized error category"
+        )
+      } finally {
+        console.error = originalConsoleError
+      }
+    })
+
+    it("OAUTH-LIFECYCLE-09: Initial token endpoint non-JSON body cannot leak sensitive markers to logs", async () => {
+      const sensitiveMarker = "SENSITIVE_PROVIDER_HTML_TOKEN_111_LEAK_TEST"
+      const originalConsoleError = console.error
+      const capturedLogs = []
+      console.error = (...args) => {
+        capturedLogs.push(args.join(" "))
+      }
+
+      try {
+        global.fetch = async (url) => {
+          const urlStr = String(url)
+          if (urlStr.includes("api.instagram.com/oauth/access_token")) {
+            return {
+              ok: true,
+              status: 200,
+              text: async () => `<html><body>Error: ${sensitiveMarker}</body></html>`,
+            }
+          }
+          throw new Error(`Unexpected fetch URL: ${urlStr}`)
+        }
+
+        const req = createCallbackRequest()
+        const res = await instagramCallback.GET(req)
+        assert.strictEqual(res.status, 302)
+        assert.ok(res.headers.get("location")?.includes("error=token_exchange_failed"))
+        assert.strictEqual(mockStore.users.length, 0, "Must not upsert user on non-JSON response")
+
+        const allLogs = capturedLogs.join("\n")
+        assert.strictEqual(
+          allLogs.includes(sensitiveMarker),
+          false,
+          "Logs must NEVER contain sensitive body preview content from non-JSON response"
+        )
+        assert.ok(
+          allLogs.includes("category=PARSE_ERROR"),
+          "Logs must contain fixed category=PARSE_ERROR"
+        )
+        assert.ok(
+          allLogs.includes("HTTP status: 200"),
+          "Logs must include numeric HTTP status"
+        )
+      } finally {
+        console.error = originalConsoleError
+      }
+    })
+
+    it("OAUTH-LIFECYCLE-10: Initial token endpoint HTTP error_message cannot leak sensitive markers to logs", async () => {
+      const sensitiveErrorMessage = "SENSITIVE_OAUTH_ERROR_REASON_222_LEAK_TEST"
+      const originalConsoleError = console.error
+      const capturedLogs = []
+      console.error = (...args) => {
+        capturedLogs.push(args.join(" "))
+      }
+
+      try {
+        global.fetch = async (url) => {
+          const urlStr = String(url)
+          if (urlStr.includes("api.instagram.com/oauth/access_token")) {
+            return {
+              ok: false,
+              status: 400,
+              text: async () => JSON.stringify({
+                error_type: "OAuthException",
+                code: 400,
+                error_message: sensitiveErrorMessage,
+              }),
+            }
+          }
+          throw new Error(`Unexpected fetch URL: ${urlStr}`)
+        }
+
+        const req = createCallbackRequest()
+        const res = await instagramCallback.GET(req)
+        assert.strictEqual(res.status, 302)
+        assert.ok(res.headers.get("location")?.includes("error=token_exchange_failed"))
+        assert.strictEqual(mockStore.users.length, 0, "Must not upsert user on HTTP error")
+
+        const allLogs = capturedLogs.join("\n")
+        assert.strictEqual(
+          allLogs.includes(sensitiveErrorMessage),
+          false,
+          "Logs must NEVER contain raw provider error_message"
+        )
+        assert.ok(
+          allLogs.includes("category=HTTP_ERROR"),
+          "Logs must contain fixed category=HTTP_ERROR"
+        )
+        assert.ok(
+          allLogs.includes("HTTP status: 400"),
+          "Logs must include numeric HTTP status"
+        )
+      } finally {
+        console.error = originalConsoleError
+      }
+    })
+
+    it("OAUTH-LIFECYCLE-11: TimeoutError is correctly classified as TIMEOUT across OAuth catch handlers", async () => {
+      const originalConsoleError = console.error
+      const capturedLogs = []
+      console.error = (...args) => {
+        capturedLogs.push(args.join(" "))
+      }
+
+      try {
+        // Case A: Profile fetch throws TimeoutError
+        global.fetch = async (url) => {
+          const urlStr = String(url)
+          if (urlStr.includes("api.instagram.com/oauth/access_token")) {
+            return {
+              ok: true,
+              status: 200,
+              text: async () => JSON.stringify({ access_token: "short_aaa", user_id: 77777 }),
+            }
+          }
+          if (urlStr.includes("graph.instagram.com/access_token")) {
+            return {
+              ok: true,
+              status: 200,
+              text: async () => JSON.stringify({
+                access_token: "long_bbb",
+                token_type: "bearer",
+                expires_in: 5184000,
+              }),
+            }
+          }
+          if (urlStr.includes("graph.instagram.com/v24.0/me")) {
+            const err = new Error("The operation was aborted due to timeout")
+            err.name = "TimeoutError"
+            throw err
+          }
+          throw new Error(`Unexpected fetch URL: ${urlStr}`)
+        }
+
+        const reqA = createCallbackRequest()
+        const resA = await instagramCallback.GET(reqA)
+        assert.strictEqual(resA.status, 302)
+        assert.ok(resA.headers.get("location")?.includes("/dashboard"))
+        assert.ok(
+          capturedLogs.some((l) => l.includes("Profile fetch failed: category=TIMEOUT")),
+          "Profile fetch must classify TimeoutError as TIMEOUT"
+        )
+
+        capturedLogs.length = 0
+        resetMockStore()
+
+        // Case B: Long-lived token fetch throws TimeoutError
+        global.fetch = async (url) => {
+          const urlStr = String(url)
+          if (urlStr.includes("api.instagram.com/oauth/access_token")) {
+            return {
+              ok: true,
+              status: 200,
+              text: async () => JSON.stringify({ access_token: "short_aaa", user_id: 77777 }),
+            }
+          }
+          if (urlStr.includes("graph.instagram.com/access_token")) {
+            const err = new Error("The operation was aborted due to timeout")
+            err.name = "TimeoutError"
+            throw err
+          }
+          throw new Error(`Unexpected fetch URL: ${urlStr}`)
+        }
+
+        const reqB = createCallbackRequest()
+        const resB = await instagramCallback.GET(reqB)
+        assert.strictEqual(resB.status, 302)
+        assert.ok(resB.headers.get("location")?.includes("error=token_exchange_failed"))
+        assert.ok(
+          capturedLogs.some((l) => l.includes("Long-lived token exchange request failed: category=TIMEOUT")),
+          "Long-lived exchange must classify TimeoutError as TIMEOUT"
+        )
+
+        capturedLogs.length = 0
+        resetMockStore()
+
+        // Case C: Initial short-lived token fetch throws TimeoutError (handled by outer catch)
+        global.fetch = async (url) => {
+          const urlStr = String(url)
+          if (urlStr.includes("api.instagram.com/oauth/access_token")) {
+            const err = new Error("The operation was aborted due to timeout")
+            err.name = "TimeoutError"
+            throw err
+          }
+          throw new Error(`Unexpected fetch URL: ${urlStr}`)
+        }
+
+        const reqC = createCallbackRequest()
+        const resC = await instagramCallback.GET(reqC)
+        assert.strictEqual(resC.status, 302)
+        assert.ok(resC.headers.get("location")?.includes("error=authentication_failed"))
+        assert.ok(
+          capturedLogs.some((l) => l.includes("Critical OAuth error: category=TIMEOUT")),
+          "Outer handler must classify TimeoutError as TIMEOUT"
+        )
+      } finally {
+        console.error = originalConsoleError
+      }
+    })
+  })
+
+  // =========================================================================
+  // SECTION: CENTRAL SESSION REVOCATION REMEDIATION
+  // =========================================================================
+  describe("[REMEDIATION] Central Session Revocation (lib/auth-session.ts)", () => {
+    const VALID_USER_ID = "10001"
+    let validToken
+
+    beforeEach(() => {
+      resetMockStore()
+      validToken = createSessionToken({ userId: VALID_USER_ID, username: "revocation_tester" })
+    })
+
+    it("SESSION-REVOCATION-01: Valid signed session + existing user -> authenticated", async () => {
+      mockStore.users.push({ id: VALID_USER_ID, username: "revocation_tester" })
+      const req = new NextRequest("http://localhost:3000/api/auth/me", {
+        headers: { Cookie: `insta_session=${validToken}` },
+      })
+      const auth = await authenticateRequest(req)
+      assert.strictEqual(auth.errorResponse, undefined)
+      assert.ok(auth.session)
+      assert.strictEqual(auth.session.userId, VALID_USER_ID)
+
+      const userQueries = mockStore.queries.filter((q) => q.table === "users")
+      assert.strictEqual(userQueries.length, 1)
+      assert.strictEqual(userQueries[0].fields, "id")
+      assert.strictEqual(userQueries[0].filters.find((f) => f.field === "id")?.value, VALID_USER_ID)
+    })
+
+    it("SESSION-REVOCATION-02: Valid signed session + missing user -> 401", async () => {
+      const req = new NextRequest("http://localhost:3000/api/auth/me", {
+        headers: { Cookie: `insta_session=${validToken}` },
+      })
+      const auth = await authenticateRequest(req)
+      assert.strictEqual(auth.session, undefined)
+      assert.ok(auth.errorResponse)
+      assert.strictEqual(auth.errorResponse.status, 401)
+      const data = await auth.errorResponse.json()
+      assert.ok(data.error?.includes("revoked or not found"))
+    })
+
+    it("SESSION-REVOCATION-03: Missing user causes session cookie expiration", async () => {
+      const req = new NextRequest("http://localhost:3000/api/auth/me", {
+        headers: { Cookie: `insta_session=${validToken}` },
+      })
+      const auth = await authenticateRequest(req)
+      assert.ok(auth.errorResponse)
+      const setCookie = auth.errorResponse.headers.get("set-cookie") || ""
+      assert.ok(setCookie.includes("insta_session="), "Must set-cookie insta_session")
+      assert.ok(setCookie.includes("Max-Age=0"), "Must set Max-Age=0 to expire session cookie")
+    })
+
+    it("SESSION-REVOCATION-04: Supabase returned error -> 503, never AuthSuccess", async () => {
+      mockStore.users.push({ id: VALID_USER_ID, username: "revocation_tester" })
+      mockStore.failNextAuthSelect = true
+
+      const req = new NextRequest("http://localhost:3000/api/auth/me", {
+        headers: { Cookie: `insta_session=${validToken}` },
+      })
+      const auth = await authenticateRequest(req)
+      assert.strictEqual(auth.session, undefined, "Must never return AuthSuccess on database error")
+      assert.ok(auth.errorResponse)
+      assert.strictEqual(auth.errorResponse.status, 503)
+      const data = await auth.errorResponse.json()
+      assert.ok(data.error?.includes("Service Unavailable"))
+    })
+
+    it("SESSION-REVOCATION-05: Thrown database/network error -> 503", async () => {
+      mockStore.users.push({ id: VALID_USER_ID, username: "revocation_tester" })
+      mockStore.throwNextAuthSelect = true
+
+      const req = new NextRequest("http://localhost:3000/api/auth/me", {
+        headers: { Cookie: `insta_session=${validToken}` },
+      })
+      const auth = await authenticateRequest(req)
+      assert.strictEqual(auth.session, undefined, "Must never return AuthSuccess on thrown error")
+      assert.ok(auth.errorResponse)
+      assert.strictEqual(auth.errorResponse.status, 503)
+      const data = await auth.errorResponse.json()
+      assert.ok(data.error?.includes("Service Unavailable"))
+    })
+
+    it("SESSION-REVOCATION-06: Invalid HMAC does not query Supabase", async () => {
+      const tamperedToken = `${validToken.split(".")[0]}.tampered_invalid_signature`
+      const req = new NextRequest("http://localhost:3000/api/auth/me", {
+        headers: { Cookie: `insta_session=${tamperedToken}` },
+      })
+      const auth = await authenticateRequest(req)
+      assert.strictEqual(auth.session, undefined)
+      assert.strictEqual(auth.errorResponse?.status, 401)
+      const userQueries = mockStore.queries.filter((q) => q.table === "users")
+      assert.strictEqual(userQueries.length, 0, "Must not query Supabase when signature is invalid")
+    })
+
+    it("SESSION-REVOCATION-07: Missing session cookie does not query Supabase", async () => {
+      const req = new NextRequest("http://localhost:3000/api/auth/me")
+      const auth = await authenticateRequest(req)
+      assert.strictEqual(auth.session, undefined)
+      assert.strictEqual(auth.errorResponse?.status, 401)
+      const userQueries = mockStore.queries.filter((q) => q.table === "users")
+      assert.strictEqual(userQueries.length, 0, "Must not query Supabase when cookie is missing")
+    })
+
+    it("SESSION-REVOCATION-08: User existence lookup uses the verified session ID, never a request-supplied ID", async () => {
+      mockStore.users.push({ id: VALID_USER_ID, username: "revocation_tester" })
+      mockStore.users.push({ id: "99999", username: "attacker" })
+
+      const req = new NextRequest("http://localhost:3000/api/auth/me?userId=99999", {
+        headers: { Cookie: `insta_session=${validToken}` },
+      })
+      const auth = await authenticateRequest(req)
+      assert.ok(auth.session)
+      assert.strictEqual(auth.session.userId, VALID_USER_ID)
+
+      const userQueries = mockStore.queries.filter((q) => q.table === "users")
+      assert.strictEqual(userQueries.length, 1)
+      const idFilter = userQueries[0].filters.find((f) => f.field === "id")
+      assert.strictEqual(idFilter?.value, VALID_USER_ID, "Lookup must strictly use verified session userId")
+    })
+
+    it("SESSION-REVOCATION-09: GET /api/auth/me rejects deleted-user sessions", async () => {
+      const req = new NextRequest("http://localhost:3000/api/auth/me", {
+        headers: { Cookie: `insta_session=${validToken}` },
+      })
+      const res = await authMe.GET(req)
+      assert.strictEqual(res.status, 401)
+      const data = await res.json()
+      assert.ok(data.error?.includes("revoked or not found"))
+
+      const setCookie = res.headers.get("set-cookie") || ""
+      assert.ok(setCookie.includes("insta_session="), "Must set-cookie to expire revoked session")
+      assert.ok(setCookie.includes("Max-Age=0"), "Must set Max-Age=0")
+    })
+  })
+
 })
