@@ -8,7 +8,25 @@ export interface MockStore {
   users: Array<{ id: string; access_token?: string; username?: string; [key: string]: any }>
   ice_breakers: Array<{ id: string; user_id: string; [key: string]: any }>
   webhook_events: Array<{ id: string; event_type: string; user_id?: any; data?: any; processed_at?: string }>
-  queries: Array<{ table: string; filters: Array<{ field: string; value: any }>; orClauses: Array<Array<{ field: string; op: string; value: string }>>; isSingle: boolean }>
+  queries: Array<{
+    table: string
+    filters: Array<{ field: string; value: any }>
+    inFilters?: Array<{ field: string; values: any[] }>
+    orClauses: Array<Array<{ field: string; op: string; value: string }>>
+    isSingle: boolean
+    isMaybeSingle?: boolean
+    isDelete?: boolean
+  }>
+  failNextInsert?: boolean
+  failNextDelete?: boolean
+  failDeleteCount?: number
+  throwNextDelete?: boolean
+  deleteAppliesThenThrows?: boolean
+  throwNextInsert?: boolean
+  insertAppliesThenThrows?: boolean
+  throwNextSelect?: boolean
+  failNextUserSelect?: boolean
+  throwNextUserSelect?: boolean
 }
 
 export const mockStore: MockStore = {
@@ -29,16 +47,28 @@ export function resetMockStore() {
   mockStore.ice_breakers = []
   mockStore.webhook_events = []
   mockStore.queries = []
+  mockStore.failNextInsert = false
+  mockStore.failNextDelete = false
+  mockStore.failDeleteCount = 0
+  mockStore.throwNextDelete = false
+  mockStore.deleteAppliesThenThrows = false
+  mockStore.throwNextInsert = false
+  mockStore.insertAppliesThenThrows = false
+  mockStore.throwNextSelect = false
+  mockStore.failNextUserSelect = false
+  mockStore.throwNextUserSelect = false
 }
 
 class QueryBuilder {
   private table: string
   private filters: Array<{ field: string; value: any }> = []
+  private inFilters: Array<{ field: string; values: any[] }> = []
   private orClauses: Array<Array<{ field: string; op: string; value: string }>> = []
   private isDelete = false
   private isUpdate = false
   private updateData: any = null
   private isSingle = false
+  private isMaybeSingle = false
   private isCount = false
 
   constructor(table: string) {
@@ -62,6 +92,35 @@ class QueryBuilder {
   }
 
   insert(data: any) {
+    if (mockStore.throwNextInsert) {
+      mockStore.throwNextInsert = false
+      throw new Error("Network connection dropped before INSERT response")
+    }
+
+    if (mockStore.insertAppliesThenThrows) {
+      mockStore.insertAppliesThenThrows = false
+      const list = Array.isArray(data) ? data : [data]
+      const inserted = list.map((item) => ({
+        id: item.id || `mock_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        ...item,
+      }))
+      const tableData = (mockStore as any)[this.table] || []
+      tableData.push(...inserted)
+      throw new Error("Network response lost after INSERT applied")
+    }
+
+    if (mockStore.failNextInsert) {
+      mockStore.failNextInsert = false
+      const error = { code: "50000", message: "Simulated insert failure" }
+      return {
+        select: () => ({
+          single: async () => ({ data: null, error }),
+          then: (resolve: any) => resolve({ data: null, error }),
+        }),
+        then: (resolve: any) => resolve({ data: null, error }),
+      }
+    }
+
     const list = Array.isArray(data) ? data : [data]
     const tableData = (mockStore as any)[this.table] || []
 
@@ -108,6 +167,11 @@ class QueryBuilder {
     return this
   }
 
+  in(field: string, values: any[]) {
+    this.inFilters.push({ field, values: Array.isArray(values) ? values : [values] })
+    return this
+  }
+
   or(clause: string) {
     const conditions = clause.split(",").map((part) => {
       const pieces = part.trim().split(".")
@@ -133,6 +197,11 @@ class QueryBuilder {
     return this.execute()
   }
 
+  maybeSingle() {
+    this.isMaybeSingle = true
+    return this.execute()
+  }
+
   then(resolve: any, reject?: any) {
     return this.execute().then(resolve, reject)
   }
@@ -142,15 +211,38 @@ class QueryBuilder {
       mockStore.queries.push({
         table: this.table,
         filters: [...this.filters],
+        inFilters: [...this.inFilters],
         orClauses: [...this.orClauses],
         isSingle: this.isSingle,
+        isMaybeSingle: this.isMaybeSingle,
+        isDelete: this.isDelete,
       })
     }
+
+    if (this.table === "users" && mockStore.throwNextUserSelect) {
+      mockStore.throwNextUserSelect = false
+      throw new Error("Simulated user lookup network failure")
+    }
+    if (this.table === "users" && mockStore.failNextUserSelect) {
+      mockStore.failNextUserSelect = false
+      return { data: null, error: { code: "50002", message: "Simulated user lookup failure" } }
+    }
+    if (mockStore.throwNextSelect) {
+      mockStore.throwNextSelect = false
+      throw new Error("Simulated query failure")
+    }
+
     let rows: any[] = [...((mockStore as any)[this.table] || [])]
 
     // Apply all .eq() filters
     for (const { field, value } of this.filters) {
       rows = rows.filter((r) => String(r[field]) === String(value))
+    }
+
+    // Apply all .in() filters
+    for (const { field, values } of this.inFilters) {
+      const stringValues = values.map((v) => String(v))
+      rows = rows.filter((r) => stringValues.includes(String(r[field])))
     }
 
     // Apply all .or() clauses
@@ -166,6 +258,26 @@ class QueryBuilder {
     }
 
     if (this.isDelete) {
+      if (mockStore.throwNextDelete) {
+        mockStore.throwNextDelete = false
+        throw new Error("Network connection dropped before DELETE response")
+      }
+      if (mockStore.deleteAppliesThenThrows) {
+        mockStore.deleteAppliesThenThrows = false
+        const remaining = ((mockStore as any)[this.table] || []).filter(
+          (r: any) => !rows.some((del) => del.id === r.id)
+        )
+        ;(mockStore as any)[this.table] = remaining
+        throw new Error("Network connection dropped after DELETE applied")
+      }
+      if (mockStore.failNextDelete) {
+        mockStore.failNextDelete = false
+        return { data: null, error: { code: "50001", message: "Simulated delete failure" } }
+      }
+      if (typeof mockStore.failDeleteCount === "number" && mockStore.failDeleteCount > 0) {
+        mockStore.failDeleteCount--
+        return { data: null, error: { code: "50001", message: "Simulated delete failure" } }
+      }
       const remaining = ((mockStore as any)[this.table] || []).filter(
         (r: any) => !rows.some((del) => del.id === r.id)
       )
@@ -182,6 +294,10 @@ class QueryBuilder {
 
     if (this.isCount) {
       return { count: rows.length, data: null, error: null }
+    }
+
+    if (this.isMaybeSingle) {
+      return { data: rows[0] || null, error: null }
     }
 
     if (this.isSingle) {

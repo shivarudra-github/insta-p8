@@ -1849,4 +1849,947 @@ describe("Security Test Suite — Phase 1 Remediation", () => {
       }
     })
   })
+
+  // =========================================================================
+  // SECTION: ICE BREAKERS DATA-LOSS REMEDIATION (app/api/ice-breakers/route.ts)
+  // =========================================================================
+  describe("[REMEDIATION] Ice Breakers Data-Loss Prevention & Atomic Safety", () => {
+    const TEST_USER = "user_ice_test"
+    let userToken
+
+    beforeEach(() => {
+      resetMockStore()
+      userToken = createSessionToken({ userId: TEST_USER, username: "ice_tester" })
+    })
+
+    it("ICE-01: Unauthenticated POST returns 401", async () => {
+      const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        body: JSON.stringify({ iceBreakers: [{ question: "Q?", response: "A" }] }),
+      })
+      const res = await iceBreakers.POST(req)
+      assert.strictEqual(res.status, 401)
+    })
+
+    it("ICE-02: Cross-user userId spoofing returns 403", async () => {
+      const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        headers: { Cookie: `insta_session=${userToken}` },
+        body: JSON.stringify({ userId: "victim_user_999", iceBreakers: [{ question: "Q?", response: "A" }] }),
+      })
+      const res = await iceBreakers.POST(req)
+      assert.strictEqual(res.status, 403)
+      const data = await res.json()
+      assert.ok(data.error?.includes("Forbidden"))
+    })
+
+    it("ICE-03: Invalid payload returns 400 without database mutations", async () => {
+      mockStore.ice_breakers.push({ id: "pre_1", user_id: TEST_USER, question: "Old Q", response: "Old A" })
+
+      const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        headers: { Cookie: `insta_session=${userToken}` },
+        body: JSON.stringify({ iceBreakers: "not-an-array" }),
+      })
+      const res = await iceBreakers.POST(req)
+      assert.strictEqual(res.status, 400)
+      assert.strictEqual(mockStore.ice_breakers.length, 1, "Existing records must remain unchanged")
+      assert.strictEqual(mockStore.ice_breakers[0].id, "pre_1")
+    })
+
+    it("ICE-04: Null/malformed entries return 400", async () => {
+      mockStore.ice_breakers.push({ id: "pre_1", user_id: TEST_USER, question: "Old Q", response: "Old A" })
+
+      // Case 1: Null entry
+      const req1 = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        headers: { Cookie: `insta_session=${userToken}` },
+        body: JSON.stringify({ iceBreakers: [null] }),
+      })
+      const res1 = await iceBreakers.POST(req1)
+      assert.strictEqual(res1.status, 400)
+
+      // Case 2: Non-object entry (string)
+      const req2 = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        headers: { Cookie: `insta_session=${userToken}` },
+        body: JSON.stringify({ iceBreakers: ["invalid_string"] }),
+      })
+      const res2 = await iceBreakers.POST(req2)
+      assert.strictEqual(res2.status, 400)
+
+      assert.strictEqual(mockStore.ice_breakers.length, 1, "Existing records must remain untouched")
+    })
+
+    it("ICE-05: Empty question or response returns 400", async () => {
+      mockStore.ice_breakers.push({ id: "pre_1", user_id: TEST_USER, question: "Old Q", response: "Old A" })
+
+      // Whitespace question
+      const req1 = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        headers: { Cookie: `insta_session=${userToken}` },
+        body: JSON.stringify({ iceBreakers: [{ question: "   ", response: "Valid response" }] }),
+      })
+      const res1 = await iceBreakers.POST(req1)
+      assert.strictEqual(res1.status, 400)
+
+      // Empty response
+      const req2 = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        headers: { Cookie: `insta_session=${userToken}` },
+        body: JSON.stringify({ iceBreakers: [{ question: "Valid question", response: "   " }] }),
+      })
+      const res2 = await iceBreakers.POST(req2)
+      assert.strictEqual(res2.status, 400)
+
+      assert.strictEqual(mockStore.ice_breakers.length, 1, "Existing records must remain untouched")
+    })
+
+    it("ICE-06: Field-length limits are enforced", async () => {
+      // Question > Instagram's 80-character limit
+      const longQ = "q".repeat(81)
+      const req1 = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        headers: { Cookie: `insta_session=${userToken}` },
+        body: JSON.stringify({ iceBreakers: [{ question: longQ, response: "Valid" }] }),
+      })
+      const res1 = await iceBreakers.POST(req1)
+      assert.strictEqual(res1.status, 400)
+      const data1 = await res1.json()
+      assert.ok(data1.error?.includes("80"))
+
+      // Response > 2000
+      const longR = "r".repeat(2001)
+      const req2 = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        headers: { Cookie: `insta_session=${userToken}` },
+        body: JSON.stringify({ iceBreakers: [{ question: "Valid", response: longR }] }),
+      })
+      const res2 = await iceBreakers.POST(req2)
+      assert.strictEqual(res2.status, 400)
+      const data2 = await res2.json()
+      assert.ok(data2.error?.includes("2000"))
+    })
+
+    it("ICE-07: More than four entries are rejected", async () => {
+      const fiveEntries = [1, 2, 3, 4, 5].map((n) => ({ question: `Question ${n}`, response: `Response ${n}` }))
+      const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        headers: { Cookie: `insta_session=${userToken}` },
+        body: JSON.stringify({ iceBreakers: fiveEntries }),
+      })
+      const res = await iceBreakers.POST(req)
+      assert.strictEqual(res.status, 400)
+      const data = await res.json()
+      assert.ok(data.error?.includes("Maximum 4"))
+    })
+
+    it("ICE-08: Insert failure preserves existing records", async () => {
+      mockStore.ice_breakers.push({ id: "pre_preserve", user_id: TEST_USER, question: "Saved Q", response: "Saved A" })
+
+      // Simulate insert error in Supabase mock
+      mockStore.failNextInsert = true
+
+      const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        headers: { Cookie: `insta_session=${userToken}` },
+        body: JSON.stringify({ iceBreakers: [{ question: "New Q", response: "New A" }] }),
+      })
+      const res = await iceBreakers.POST(req)
+      assert.strictEqual(res.status, 500)
+
+      // Existing records MUST remain completely intact
+      const existing = mockStore.ice_breakers.filter((r) => r.user_id === TEST_USER)
+      assert.strictEqual(existing.length, 1)
+      assert.strictEqual(existing[0].id, "pre_preserve")
+      assert.strictEqual(existing[0].question, "Saved Q")
+    })
+
+    it("ICE-09: Delete failure preserves existing records and preserves new rows without destructive rollback", async () => {
+      mockStore.ice_breakers.push({ id: "pre_exist", user_id: TEST_USER, question: "Saved Q", response: "Saved A" })
+
+      // Simulate bulk delete failure
+      mockStore.failNextDelete = true
+
+      const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        headers: { Cookie: `insta_session=${userToken}` },
+        body: JSON.stringify({ iceBreakers: [{ question: "New Q", response: "New A" }] }),
+      })
+      const res = await iceBreakers.POST(req)
+      assert.strictEqual(res.status, 500)
+      const data = await res.json()
+      assert.strictEqual(data.success, false)
+      assert.ok(data.warning?.includes("Duplicate entries may remain"))
+
+      // Both the pre-existing record AND newly inserted record remain preserved (no destructive rollback)
+      const records = mockStore.ice_breakers.filter((r) => r.user_id === TEST_USER)
+      assert.strictEqual(records.length, 2, "Both old and new rows must be preserved to prevent data loss")
+      assert.ok(records.some((r) => r.id === "pre_exist"))
+      assert.ok(records.some((r) => r.question === "New Q"))
+    })
+
+    it("ICE-10: Database failure does not expose raw error messages or internal error details", async () => {
+      mockStore.failNextInsert = true
+
+      const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        headers: { Cookie: `insta_session=${userToken}` },
+        body: JSON.stringify({ iceBreakers: [{ question: "New Q2", response: "New A2" }] }),
+      })
+      const res = await iceBreakers.POST(req)
+      assert.strictEqual(res.status, 500)
+      const data = await res.json()
+      assert.strictEqual(data.error, "Failed to save new ice breakers. Existing records were preserved.")
+      assert.strictEqual(data.stack, undefined)
+      assert.strictEqual(data.code, undefined)
+    })
+
+    it("ICE-11: Successful replacement stores the new records under the authenticated user", async () => {
+      mockStore.ice_breakers.push(
+        { id: "old_ib_1", user_id: TEST_USER, question: "Old 1", response: "Resp 1" },
+        { id: "old_ib_2", user_id: TEST_USER, question: "Old 2", response: "Resp 2" }
+      )
+      // Also add someone else's record to ensure no cross-user deletion
+      mockStore.ice_breakers.push({ id: "other_user_ib", user_id: "other_user", question: "Other Q", response: "Other R" })
+
+      const origFetch = global.fetch
+      try {
+        global.fetch = async () => ({
+          ok: true,
+          status: 200,
+          json: async () => ({ result: "success" }),
+        })
+
+        const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+          method: "POST",
+          headers: { Cookie: `insta_session=${userToken}` },
+          body: JSON.stringify({
+            userId: TEST_USER,
+            iceBreakers: [
+              { question: "New Q1?", response: "New A1" },
+              { question: "New Q2?", response: "New A2" },
+            ],
+          }),
+        })
+        const res = await iceBreakers.POST(req)
+        assert.strictEqual(res.status, 200)
+        const data = await res.json()
+        assert.strictEqual(data.success, true)
+        assert.strictEqual(data.data.length, 2)
+
+        // Check mockStore
+        const userRecords = mockStore.ice_breakers.filter((r) => r.user_id === TEST_USER)
+        assert.strictEqual(userRecords.length, 2)
+        assert.strictEqual(userRecords[0].question, "New Q1?")
+        assert.strictEqual(userRecords[1].question, "New Q2?")
+
+        // Verify bulk delete query used single .in() filter
+        const deleteQueries = mockStore.queries.filter((q) => q.table === "ice_breakers" && q.isDelete)
+        assert.strictEqual(deleteQueries.length, 1, "Must execute exactly ONE bulk delete statement")
+        assert.ok(deleteQueries[0].inFilters.some((f) => f.field === "id"))
+
+        // Other user's record MUST NOT be touched
+        assert.ok(mockStore.ice_breakers.some((r) => r.id === "other_user_ib"))
+      } finally {
+        global.fetch = origFetch
+      }
+    })
+
+    it("ICE-12: Instagram sync HTTP failure is reported accurately", async () => {
+      mockStore.users.push({
+        id: TEST_USER,
+        access_token: "test_ig_token_abc",
+        page_id: "page_12345",
+      })
+
+      const origFetch = global.fetch
+      try {
+        global.fetch = async () => ({
+          ok: false,
+          status: 500,
+          json: async () => ({
+            error: { message: "Instagram API service unavailable", type: "OAuthException", code: 2 },
+          }),
+        })
+
+        const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+          method: "POST",
+          headers: { Cookie: `insta_session=${userToken}` },
+          body: JSON.stringify({
+            iceBreakers: [{ question: "Working Question", response: "Working Response" }],
+          }),
+        })
+        const res = await iceBreakers.POST(req)
+        assert.strictEqual(res.status, 200)
+        const data = await res.json()
+        assert.strictEqual(data.success, true, "DB save must be marked successful")
+        assert.strictEqual(data.warning, "Saved to database, but Instagram sync failed. Check your Instagram connection and try syncing again.")
+        assert.strictEqual(data.error, "Instagram API synchronization failed")
+
+        // Records were still saved in the database
+        const userRecords = mockStore.ice_breakers.filter((r) => r.user_id === TEST_USER)
+        assert.strictEqual(userRecords.length, 1)
+        assert.strictEqual(userRecords[0].question, "Working Question")
+      } finally {
+        global.fetch = origFetch
+      }
+    })
+
+    it("ICE-13: Partial delete data-loss fix: preserves both old rows and new rows on bulk DELETE failure with clear warning", async () => {
+      // Seed two existing old Ice Breaker rows
+      mockStore.ice_breakers.push(
+        { id: "old_row_1", user_id: TEST_USER, question: "Old Question 1", response: "Old Answer 1" },
+        { id: "old_row_2", user_id: TEST_USER, question: "Old Question 2", response: "Old Answer 2" }
+      )
+
+      // Simulate bulk DELETE failure
+      mockStore.failNextDelete = true
+
+      const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        headers: { Cookie: `insta_session=${userToken}` },
+        body: JSON.stringify({
+          iceBreakers: [
+            { question: "Replacement Question 1", response: "Replacement Answer 1" },
+            { question: "Replacement Question 2", response: "Replacement Answer 2" },
+          ],
+        }),
+      })
+      const res = await iceBreakers.POST(req)
+      assert.strictEqual(res.status, 500)
+      const data = await res.json()
+      assert.strictEqual(data.success, false)
+
+      // Verify the response explicitly warns that cleanup failed and duplicates may remain
+      assert.ok(data.warning?.includes("Duplicate entries may remain") || data.warning?.includes("duplicate"))
+      assert.ok(data.error?.includes("confirmed") || data.error?.includes("duplicate") || data.error?.includes("preserved"))
+
+      // Verify both old rows remain
+      assert.ok(mockStore.ice_breakers.some((r) => r.id === "old_row_1"), "First old row must remain")
+      assert.ok(mockStore.ice_breakers.some((r) => r.id === "old_row_2"), "Second old row must remain")
+
+      // Verify newly inserted rows are not destructively cleaned up
+      const replacementRows = mockStore.ice_breakers.filter(
+        (r) => r.user_id === TEST_USER && r.question.startsWith("Replacement Question")
+      )
+      assert.strictEqual(replacementRows.length, 2, "Replacement rows must be preserved to prevent total data loss")
+    })
+
+    it("ICE-14: Empty-array payload executes single bulk DELETE to clear all user records", async () => {
+      mockStore.ice_breakers.push(
+        { id: "clear_1", user_id: TEST_USER, question: "Q1", response: "A1" },
+        { id: "clear_2", user_id: TEST_USER, question: "Q2", response: "A2" }
+      )
+
+      const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        headers: { Cookie: `insta_session=${userToken}` },
+        body: JSON.stringify({ iceBreakers: [] }),
+      })
+      const res = await iceBreakers.POST(req)
+      assert.strictEqual(res.status, 200)
+      const data = await res.json()
+      assert.strictEqual(data.success, true)
+      assert.deepStrictEqual(data.data, [])
+
+      const remaining = mockStore.ice_breakers.filter((r) => r.user_id === TEST_USER)
+      assert.strictEqual(remaining.length, 0, "All user ice breakers must be cleared")
+
+      const deleteQueries = mockStore.queries.filter((q) => q.table === "ice_breakers" && q.isDelete)
+      assert.strictEqual(deleteQueries.length, 1, "Must execute exactly ONE bulk delete statement")
+    })
+
+    it("ICE-15: When oldIds is empty, skip DELETE request entirely", async () => {
+      // User has 0 existing records
+      assert.strictEqual(mockStore.ice_breakers.filter((r) => r.user_id === TEST_USER).length, 0)
+
+      const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        headers: { Cookie: `insta_session=${userToken}` },
+        body: JSON.stringify({
+          iceBreakers: [{ question: "First Ever Question", response: "First Ever Response" }],
+        }),
+      })
+      const res = await iceBreakers.POST(req)
+      assert.strictEqual(res.status, 200)
+
+      const deleteQueries = mockStore.queries.filter((q) => q.table === "ice_breakers" && q.isDelete)
+      assert.strictEqual(deleteQueries.length, 0, "No DELETE statement should be executed when user has 0 prior records")
+
+      const userRecords = mockStore.ice_breakers.filter((r) => r.user_id === TEST_USER)
+      assert.strictEqual(userRecords.length, 1)
+      assert.strictEqual(userRecords[0].question, "First Ever Question")
+    })
+
+    it("ICE-16: Delete applies in database but response is lost; API returns partialSuccess and does not delete new records", async () => {
+      mockStore.ice_breakers.push(
+        { id: "old_row_16", user_id: TEST_USER, question: "Old Q16", response: "Old A16" }
+      )
+
+      // Simulate DELETE that applies in database, but network drops before response is delivered
+      mockStore.deleteAppliesThenThrows = true
+
+      const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        headers: { Cookie: `insta_session=${userToken}` },
+        body: JSON.stringify({
+          iceBreakers: [{ question: "Replacement 16", response: "Answer 16" }],
+        }),
+      })
+      const res = await iceBreakers.POST(req)
+      assert.strictEqual(res.status, 500)
+      const data = await res.json()
+
+      assert.strictEqual(data.success, false)
+      assert.strictEqual(data.partialSuccess, true)
+      assert.ok(data.warning?.includes("could not be confirmed"))
+      // Verify API does NOT falsely claim old records are preserved
+      assert.strictEqual(data.error?.includes("Old records were preserved"), false)
+
+      // Verify newly inserted records are NOT deleted
+      const userRecords = mockStore.ice_breakers.filter((r) => r.user_id === TEST_USER)
+      assert.ok(userRecords.some((r) => r.question === "Replacement 16"))
+    })
+
+    it("ICE-17: Thrown DELETE failure before execution preserves new rows and returns explicit uncertain-outcome response", async () => {
+      mockStore.ice_breakers.push(
+        { id: "old_row_17", user_id: TEST_USER, question: "Old Q17", response: "Old A17" }
+      )
+
+      // Simulate network failure thrown by client before DELETE completes
+      mockStore.throwNextDelete = true
+
+      const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        headers: { Cookie: `insta_session=${userToken}` },
+        body: JSON.stringify({
+          iceBreakers: [{ question: "Replacement 17", response: "Answer 17" }],
+        }),
+      })
+      const res = await iceBreakers.POST(req)
+      assert.strictEqual(res.status, 500)
+      const data = await res.json()
+
+      assert.strictEqual(data.success, false)
+      assert.strictEqual(data.partialSuccess, true)
+      assert.ok(data.warning?.includes("could not be confirmed"))
+      assert.ok(data.error?.includes("could not be fully confirmed"))
+
+      // Verify no destructive rollback of newly inserted rows
+      const userRecords = mockStore.ice_breakers.filter((r) => r.user_id === TEST_USER)
+      assert.ok(userRecords.some((r) => r.question === "Replacement 17"))
+      // Verify old row was not deleted in mock
+      assert.ok(userRecords.some((r) => r.id === "old_row_17"))
+    })
+
+    it("ICE-18: Invalid Instagram JSON response with HTTP 200 must not be reported as confirmed successful sync", async () => {
+      mockStore.users.push({
+        id: TEST_USER,
+        access_token: "test_ig_token_abc",
+        page_id: "page_12345",
+      })
+
+      const origFetch = global.fetch
+      try {
+        // Return HTTP 200, but with invalid JSON / non-object payload
+        global.fetch = async () => ({
+          ok: true,
+          status: 200,
+          json: async () => {
+            throw new Error("Unexpected end of JSON input")
+          },
+        })
+
+        const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+          method: "POST",
+          headers: { Cookie: `insta_session=${userToken}` },
+          body: JSON.stringify({
+            iceBreakers: [{ question: "Valid Question 18", response: "Valid Response 18" }],
+          }),
+        })
+        const res = await iceBreakers.POST(req)
+        assert.strictEqual(res.status, 200)
+        const data = await res.json()
+
+        // DB save succeeds, but sync must NOT be reported as confirmed
+        assert.strictEqual(data.success, true)
+        assert.strictEqual(data.warning, "Saved to database, but Instagram sync failed. Check your Instagram connection and try syncing again.")
+        assert.strictEqual(data.error, "Instagram API synchronization failed")
+      } finally {
+        global.fetch = origFetch
+      }
+    })
+
+    it("ICE-19: Verify database-save success with Instagram sync warning is distinguishable from full success", async () => {
+      mockStore.users.push({
+        id: TEST_USER,
+        access_token: "test_ig_token_abc",
+        page_id: "page_12345",
+      })
+
+      const origFetch = global.fetch
+      try {
+        // 1. Full success: HTTP 200 with valid Instagram JSON
+        global.fetch = async () => ({
+          ok: true,
+          status: 200,
+          json: async () => ({ result: "success" }),
+        })
+
+        const req1 = new NextRequest("http://localhost:3000/api/ice-breakers", {
+          method: "POST",
+          headers: { Cookie: `insta_session=${userToken}` },
+          body: JSON.stringify({
+            iceBreakers: [{ question: "Question 19A", response: "Response 19A" }],
+          }),
+        })
+        const res1 = await iceBreakers.POST(req1)
+        assert.strictEqual(res1.status, 200)
+        const data1 = await res1.json()
+        assert.strictEqual(data1.success, true)
+        assert.strictEqual(data1.warning, undefined, "Full success must not have a warning")
+        assert.strictEqual(data1.error, undefined, "Full success must not have an error")
+
+        // 2. Partial sync warning: HTTP 200 with API error object in JSON
+        global.fetch = async () => ({
+          ok: true,
+          status: 200,
+          json: async () => ({ error: { message: "Permission Denied", code: 200 } }),
+        })
+
+        const req2 = new NextRequest("http://localhost:3000/api/ice-breakers", {
+          method: "POST",
+          headers: { Cookie: `insta_session=${userToken}` },
+          body: JSON.stringify({
+            iceBreakers: [{ question: "Question 19B", response: "Response 19B" }],
+          }),
+        })
+        const res2 = await iceBreakers.POST(req2)
+        assert.strictEqual(res2.status, 200)
+        const data2 = await res2.json()
+        assert.strictEqual(data2.success, true)
+        assert.strictEqual(data2.warning, "Saved to database, but Instagram sync failed. Check your Instagram connection and try syncing again.", "Sync failure must be distinguished with warning")
+        assert.ok(data2.error !== undefined, "Sync failure must include error explanation")
+      } finally {
+        global.fetch = origFetch
+      }
+    })
+
+    it("ICE-20: Empty-array DELETE failure returns operationUncertain flag and preserves uncertainty", async () => {
+      mockStore.ice_breakers.push(
+        { id: "del_fail_1", user_id: TEST_USER, question: "Q1", response: "A1" }
+      )
+
+      // Simulate network exception during empty-array delete
+      mockStore.throwNextDelete = true
+
+      const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        headers: { Cookie: `insta_session=${userToken}` },
+        body: JSON.stringify({ iceBreakers: [] }),
+      })
+      const res = await iceBreakers.POST(req)
+      assert.strictEqual(res.status, 500)
+      const data = await res.json()
+
+      assert.strictEqual(data.success, false)
+      assert.strictEqual(data.operationUncertain, true, "Must flag operationUncertain: true")
+      assert.ok(data.warning?.includes("could not be confirmed"))
+      assert.ok(data.warning?.includes("not retry immediately"))
+    })
+
+    it("ICE-21: INSERT applies but response is lost; old records are not deleted and response warns against immediate retry", async () => {
+      mockStore.ice_breakers.push(
+        { id: "old_row_21", user_id: TEST_USER, question: "Old Q21", response: "Old A21" }
+      )
+
+      // Simulate INSERT that applies in database, but response network drops
+      mockStore.insertAppliesThenThrows = true
+
+      const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        headers: { Cookie: `insta_session=${userToken}` },
+        body: JSON.stringify({
+          iceBreakers: [{ question: "New Q21", response: "New A21" }],
+        }),
+      })
+      const res = await iceBreakers.POST(req)
+      assert.strictEqual(res.status, 500)
+      const data = await res.json()
+
+      assert.strictEqual(data.success, false)
+      assert.strictEqual(data.operationUncertain, true, "Must flag operationUncertain: true")
+      assert.ok(data.warning?.includes("not retry immediately"))
+      assert.ok(data.warning?.includes("Old records were preserved"))
+
+      // Verify old records were NOT deleted
+      assert.ok(mockStore.ice_breakers.some((r) => r.id === "old_row_21"))
+    })
+
+    it("ICE-22: INSERT throws before execution; old records remain and result is reported accurately", async () => {
+      mockStore.ice_breakers.push(
+        { id: "old_row_22", user_id: TEST_USER, question: "Old Q22", response: "Old A22" }
+      )
+
+      // Simulate network failure thrown before INSERT commits
+      mockStore.throwNextInsert = true
+
+      const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        headers: { Cookie: `insta_session=${userToken}` },
+        body: JSON.stringify({
+          iceBreakers: [{ question: "New Q22", response: "New A22" }],
+        }),
+      })
+      const res = await iceBreakers.POST(req)
+      assert.strictEqual(res.status, 500)
+      const data = await res.json()
+
+      assert.strictEqual(data.success, false)
+      assert.strictEqual(data.operationUncertain, true)
+      assert.ok(data.warning?.includes("not retry immediately"))
+
+      // Verify old records remain intact
+      assert.ok(mockStore.ice_breakers.some((r) => r.id === "old_row_22"))
+    })
+
+    it("ICE-23: GET failure does not log raw exception details or leak sensitive internals", async () => {
+      const originalConsoleError = console.error
+      const errorLogs = []
+      console.error = (...args) => {
+        errorLogs.push(args.join(" "))
+      }
+
+      try {
+        mockStore.throwNextSelect = true
+        const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+          headers: { Cookie: `insta_session=${userToken}` },
+        })
+        const res = await iceBreakers.GET(req)
+        assert.strictEqual(res.status, 500)
+        const data = await res.json()
+        assert.strictEqual(data.error, "Internal Server Error")
+        assert.strictEqual(data.stack, undefined)
+        assert.strictEqual(data.message, undefined)
+
+        const loggedText = errorLogs.join(" ")
+        assert.ok(loggedText.includes("category=UNHANDLED_EXCEPTION"))
+        assert.strictEqual(loggedText.includes("Simulated query failure"), false)
+        assert.strictEqual(loggedText.includes("TypeError"), false)
+      } finally {
+        mockStore.throwNextSelect = false
+        console.error = originalConsoleError
+      }
+    })
+
+    it("ICE-24: Empty object and array provider responses are not treated as confirmed Instagram sync success", async () => {
+      mockStore.users.push({
+        id: TEST_USER,
+        access_token: "test_ig_token_abc",
+        page_id: "page_12345",
+      })
+
+      const origFetch = global.fetch
+      try {
+        // Case A: Provider returns empty object {} with HTTP 200
+        global.fetch = async () => ({
+          ok: true,
+          status: 200,
+          json: async () => ({}),
+        })
+
+        const req1 = new NextRequest("http://localhost:3000/api/ice-breakers", {
+          method: "POST",
+          headers: { Cookie: `insta_session=${userToken}` },
+          body: JSON.stringify({
+            iceBreakers: [{ question: "Question 24A", response: "Response 24A" }],
+          }),
+        })
+        const res1 = await iceBreakers.POST(req1)
+        assert.strictEqual(res1.status, 200)
+        const data1 = await res1.json()
+        assert.strictEqual(data1.success, true)
+        assert.strictEqual(data1.warning, "Saved to database, but Instagram sync failed. Check your Instagram connection and try syncing again.", "Empty {} must NOT be treated as confirmed sync")
+
+        // Case B: Provider returns array [] with HTTP 200
+        global.fetch = async () => ({
+          ok: true,
+          status: 200,
+          json: async () => ([]),
+        })
+
+        const req2 = new NextRequest("http://localhost:3000/api/ice-breakers", {
+          method: "POST",
+          headers: { Cookie: `insta_session=${userToken}` },
+          body: JSON.stringify({
+            iceBreakers: [{ question: "Question 24B", response: "Response 24B" }],
+          }),
+        })
+        const res2 = await iceBreakers.POST(req2)
+        assert.strictEqual(res2.status, 200)
+        const data2 = await res2.json()
+        assert.strictEqual(data2.success, true)
+        assert.strictEqual(data2.warning, "Saved to database, but Instagram sync failed. Check your Instagram connection and try syncing again.", "Array [] must NOT be treated as confirmed sync")
+      } finally {
+        global.fetch = origFetch
+      }
+    })
+    it("ICE-25: Accepts an 80-character question at the exact boundary", async () => {
+      const question = "q".repeat(80)
+      const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+        method: "POST",
+        headers: { Cookie: `insta_session=${userToken}` },
+        body: JSON.stringify({ iceBreakers: [{ question, response: "Valid response" }] }),
+      })
+      const res = await iceBreakers.POST(req)
+      assert.strictEqual(res.status, 200)
+      const data = await res.json()
+      assert.strictEqual(data.success, true)
+      assert.strictEqual(data.data[0].question.length, 80)
+    })
+
+    it("ICE-26: Empty list clears Instagram ice breakers with one DELETE request", async () => {
+      mockStore.ice_breakers.push({ id: "clear_remote_26", user_id: TEST_USER, question: "Old Q", response: "Old A" })
+      mockStore.users.push({ id: TEST_USER, access_token: "test_ig_token_26" })
+
+      const originalFetch = global.fetch
+      let capturedUrl = ""
+      let capturedInit = null
+      try {
+        global.fetch = async (url, init) => {
+          capturedUrl = String(url)
+          capturedInit = init
+          return { ok: true, status: 200, json: async () => ({ result: "success" }) }
+        }
+
+        const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+          method: "POST",
+          headers: { Cookie: `insta_session=${userToken}` },
+          body: JSON.stringify({ iceBreakers: [] }),
+        })
+        const res = await iceBreakers.POST(req)
+        const data = await res.json()
+        const requestUrl = new URL(capturedUrl)
+
+        assert.strictEqual(res.status, 200)
+        assert.strictEqual(data.success, true)
+        assert.deepStrictEqual(data.data, [])
+        assert.strictEqual(mockStore.ice_breakers.filter((r) => r.user_id === TEST_USER).length, 0)
+        assert.strictEqual(capturedInit.method, "DELETE")
+        assert.strictEqual(requestUrl.searchParams.get("fields"), "['ice_breakers']")
+        assert.strictEqual(capturedInit.headers.Authorization, "Bearer test_ig_token_26")
+        assert.strictEqual(capturedInit.body, undefined)
+        assert.ok(capturedInit.signal instanceof AbortSignal, "Must pass AbortSignal timeout")
+      } finally {
+        global.fetch = originalFetch
+      }
+    })
+
+    it("ICE-27: Database clear remains successful but warns when Instagram DELETE fails", async () => {
+      mockStore.ice_breakers.push({ id: "clear_remote_27", user_id: TEST_USER, question: "Old Q", response: "Old A" })
+      mockStore.users.push({ id: TEST_USER, access_token: "test_ig_token_27" })
+
+      const originalFetch = global.fetch
+      try {
+        global.fetch = async () => ({
+          ok: false,
+          status: 500,
+          json: async () => ({ error: { code: 2 } }),
+        })
+
+        const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+          method: "POST",
+          headers: { Cookie: `insta_session=${userToken}` },
+          body: JSON.stringify({ iceBreakers: [] }),
+        })
+        const res = await iceBreakers.POST(req)
+        const data = await res.json()
+
+        assert.strictEqual(res.status, 200)
+        assert.strictEqual(data.success, true)
+        assert.ok(data.warning?.includes("Instagram sync failed"))
+        assert.strictEqual(mockStore.ice_breakers.filter((r) => r.user_id === TEST_USER).length, 0)
+      } finally {
+        global.fetch = originalFetch
+      }
+    })
+
+    it("ICE-28: Missing Instagram user record warns after database save and still performs lookup", async () => {
+      const originalFetch = global.fetch
+      let fetchCalled = false
+      try {
+        global.fetch = async () => {
+          fetchCalled = true
+          throw new Error("Fetch must not run without credentials")
+        }
+
+        const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+          method: "POST",
+          headers: { Cookie: `insta_session=${userToken}` },
+          body: JSON.stringify({ iceBreakers: [{ question: "Saved locally", response: "Response" }] }),
+        })
+        const res = await iceBreakers.POST(req)
+        const data = await res.json()
+
+        assert.strictEqual(res.status, 200)
+        assert.strictEqual(data.success, true)
+        assert.ok(data.warning?.includes("no Instagram access token"))
+        assert.strictEqual(fetchCalled, false)
+        assert.ok(mockStore.queries.some((q) => q.table === "users" && q.isMaybeSingle && q.filters.some((f) => f.field === "id" && f.value === TEST_USER)))
+        assert.strictEqual(mockStore.ice_breakers.filter((r) => r.user_id === TEST_USER).length, 1)
+      } finally {
+        global.fetch = originalFetch
+      }
+    })
+
+    it("ICE-29: User lookup errors warn instead of reporting full Instagram sync success", async () => {
+      mockStore.failNextUserSelect = true
+      const originalFetch = global.fetch
+      let fetchCalled = false
+      try {
+        global.fetch = async () => {
+          fetchCalled = true
+          throw new Error("Fetch must not run when credential lookup fails")
+        }
+
+        const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+          method: "POST",
+          headers: { Cookie: `insta_session=${userToken}` },
+          body: JSON.stringify({ iceBreakers: [{ question: "Saved with lookup error", response: "Response" }] }),
+        })
+        const res = await iceBreakers.POST(req)
+        const data = await res.json()
+
+        assert.strictEqual(res.status, 200)
+        assert.strictEqual(data.success, true)
+        assert.ok(data.warning?.includes("connection could not be verified"))
+        assert.strictEqual(fetchCalled, false)
+        assert.strictEqual(mockStore.ice_breakers.filter((r) => r.user_id === TEST_USER).length, 1)
+      } finally {
+        global.fetch = originalFetch
+      }
+    })
+
+    it("ICE-30: Thrown user lookup failures are contained and reported as sync warnings", async () => {
+      mockStore.throwNextUserSelect = true
+      const originalFetch = global.fetch
+      try {
+        global.fetch = async () => {
+          throw new Error("Fetch must not run after a failed credential lookup")
+        }
+
+        const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+          method: "POST",
+          headers: { Cookie: `insta_session=${userToken}` },
+          body: JSON.stringify({ iceBreakers: [{ question: "Saved despite lookup throw", response: "Response" }] }),
+        })
+        const res = await iceBreakers.POST(req)
+        const data = await res.json()
+
+        assert.strictEqual(res.status, 200)
+        assert.strictEqual(data.success, true)
+        assert.ok(data.warning?.includes("connection could not be verified"))
+        assert.ok(mockStore.queries.some((q) => q.table === "users" && q.isMaybeSingle))
+        assert.strictEqual(mockStore.ice_breakers.filter((r) => r.user_id === TEST_USER).length, 1)
+      } finally {
+        global.fetch = originalFetch
+      }
+    })
+
+    it("ICE-31: Instagram POST uses the authenticated user's token and saved payload IDs", async () => {
+      mockStore.users.push({ id: TEST_USER, access_token: "test_ig_token_31" })
+      const originalFetch = global.fetch
+      let capturedUrl = ""
+      let capturedInit = null
+      try {
+        global.fetch = async (url, init) => {
+          capturedUrl = String(url)
+          capturedInit = init
+          return { ok: true, status: 200, json: async () => ({ result: "success" }) }
+        }
+
+        const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+          method: "POST",
+          headers: { Cookie: `insta_session=${userToken}` },
+          body: JSON.stringify({ iceBreakers: [{ question: "Where are you based?", response: "We are based in India." }] }),
+        })
+        const res = await iceBreakers.POST(req)
+        const data = await res.json()
+        const url = new URL(capturedUrl)
+
+        assert.strictEqual(res.status, 200)
+        assert.strictEqual(data.success, true)
+        assert.strictEqual(data.warning, undefined)
+        assert.strictEqual(capturedInit.method, "POST")
+        assert.strictEqual(url.pathname, "/v24.0/me/messenger_profile")
+        assert.strictEqual(url.searchParams.has("access_token"), false)
+        assert.strictEqual(capturedInit.headers.Authorization, "Bearer test_ig_token_31")
+        assert.strictEqual(capturedInit.headers["Content-Type"], undefined, "Must not manually set multipart Content-Type")
+        assert.ok(capturedInit.body instanceof FormData, "Body must be a FormData instance")
+        assert.strictEqual(capturedInit.body.get("platform"), "instagram")
+        const iceBreakersField = JSON.parse(capturedInit.body.get("ice_breakers"))
+        assert.strictEqual(Array.isArray(iceBreakersField), true)
+        assert.strictEqual(iceBreakersField[0].question, "Where are you based?")
+        assert.strictEqual(iceBreakersField[0].payload, `ICE_BREAKER_${data.data[0].id}`)
+        assert.ok(capturedInit.signal instanceof AbortSignal, "Must pass AbortSignal timeout")
+      } finally {
+        global.fetch = originalFetch
+      }
+    })
+
+    it("ICE-32: Only Meta's documented result success shape is accepted as sync success", async () => {
+      mockStore.users.push({ id: TEST_USER, access_token: "test_ig_token_32" })
+      const originalFetch = global.fetch
+      try {
+        global.fetch = async () => ({
+          ok: true,
+          status: 200,
+          json: async () => ({ success: true }),
+        })
+
+        const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+          method: "POST",
+          headers: { Cookie: `insta_session=${userToken}` },
+          body: JSON.stringify({ iceBreakers: [{ question: "Valid question", response: "Saved response" }] }),
+        })
+        const res = await iceBreakers.POST(req)
+        const data = await res.json()
+
+        assert.strictEqual(res.status, 200)
+        assert.strictEqual(data.success, true)
+        assert.ok(data.warning?.includes("Instagram sync failed"))
+        assert.strictEqual(mockStore.ice_breakers.filter((r) => r.user_id === TEST_USER).length, 1)
+      } finally {
+        global.fetch = originalFetch
+      }
+    })
+
+    it("ICE-33: Missing access token never reports a full database-and-Instagram success", async () => {
+      mockStore.users.push({ id: TEST_USER })
+      const originalFetch = global.fetch
+      let fetchCalled = false
+      try {
+        global.fetch = async () => {
+          fetchCalled = true
+          throw new Error("Fetch must not run without an access token")
+        }
+
+        const req = new NextRequest("http://localhost:3000/api/ice-breakers", {
+          method: "POST",
+          headers: { Cookie: `insta_session=${userToken}` },
+          body: JSON.stringify({ iceBreakers: [{ question: "No token", response: "Response" }] }),
+        })
+        const res = await iceBreakers.POST(req)
+        const data = await res.json()
+
+        assert.strictEqual(res.status, 200)
+        assert.strictEqual(data.success, true)
+        assert.ok(data.warning?.includes("no Instagram access token"))
+        assert.strictEqual(fetchCalled, false)
+      } finally {
+        global.fetch = originalFetch
+      }
+    })
+  })
 })
