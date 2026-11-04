@@ -10,6 +10,7 @@ export interface MockStore {
   webhook_events: Array<{ id: string; event_type: string; user_id?: any; data?: any; processed_at?: string }>
   queries: Array<{
     table: string
+    fields?: string
     filters: Array<{ field: string; value: any }>
     inFilters?: Array<{ field: string; values: any[] }>
     orClauses: Array<Array<{ field: string; op: string; value: string }>>
@@ -27,6 +28,8 @@ export interface MockStore {
   throwNextSelect?: boolean
   failNextUserSelect?: boolean
   throwNextUserSelect?: boolean
+  failNextAuthSelect?: boolean
+  throwNextAuthSelect?: boolean
 }
 
 export const mockStore: MockStore = {
@@ -57,10 +60,13 @@ export function resetMockStore() {
   mockStore.throwNextSelect = false
   mockStore.failNextUserSelect = false
   mockStore.throwNextUserSelect = false
+  mockStore.failNextAuthSelect = false
+  mockStore.throwNextAuthSelect = false
 }
 
 class QueryBuilder {
   private table: string
+  private fields = "*"
   private filters: Array<{ field: string; value: any }> = []
   private inFilters: Array<{ field: string; values: any[] }> = []
   private orClauses: Array<Array<{ field: string; op: string; value: string }>> = []
@@ -75,7 +81,8 @@ class QueryBuilder {
     this.table = table
   }
 
-  select(_fields = "*", options?: { count?: string; head?: boolean }) {
+  select(fields = "*", options?: { count?: string; head?: boolean }) {
+    this.fields = fields
     if (options?.count) this.isCount = true
     return this
   }
@@ -210,6 +217,7 @@ class QueryBuilder {
     if (mockStore.queries) {
       mockStore.queries.push({
         table: this.table,
+        fields: this.fields,
         filters: [...this.filters],
         inFilters: [...this.inFilters],
         orClauses: [...this.orClauses],
@@ -219,15 +227,27 @@ class QueryBuilder {
       })
     }
 
-    if (this.table === "users" && mockStore.throwNextUserSelect) {
+    // Auth session verification failure simulations
+    if (this.table === "users" && this.fields === "id" && mockStore.failNextAuthSelect) {
+      mockStore.failNextAuthSelect = false
+      return { data: null, error: { code: "50003", message: "Simulated auth database failure" } }
+    }
+    if (this.table === "users" && this.fields === "id" && mockStore.throwNextAuthSelect) {
+      mockStore.throwNextAuthSelect = false
+      throw new Error("Simulated auth lookup network failure")
+    }
+
+    // Instagram connection user lookup failure simulations
+    if (this.table === "users" && this.fields.includes("access_token") && mockStore.throwNextUserSelect) {
       mockStore.throwNextUserSelect = false
       throw new Error("Simulated user lookup network failure")
     }
-    if (this.table === "users" && mockStore.failNextUserSelect) {
+    if (this.table === "users" && this.fields.includes("access_token") && mockStore.failNextUserSelect) {
       mockStore.failNextUserSelect = false
       return { data: null, error: { code: "50002", message: "Simulated user lookup failure" } }
     }
-    if (mockStore.throwNextSelect) {
+
+    if (this.table !== "users" && mockStore.throwNextSelect) {
       mockStore.throwNextSelect = false
       throw new Error("Simulated query failure")
     }
@@ -255,6 +275,10 @@ class QueryBuilder {
           return false
         })
       )
+    }
+
+    if (this.table === "users" && (this.isSingle || this.isMaybeSingle) && rows.length > 1) {
+      rows = [rows[rows.length - 1]]
     }
 
     if (this.isDelete) {
@@ -313,4 +337,3 @@ export async function getSupabaseServerClient() {
     from: (table: string) => new QueryBuilder(table),
   }
 }
-

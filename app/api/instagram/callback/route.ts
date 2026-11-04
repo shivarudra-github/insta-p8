@@ -105,6 +105,7 @@ export async function GET(request: NextRequest) {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: tokenParams.toString(),
+      signal: AbortSignal.timeout(10000),
     })
 
     // Safe response parsing: read as text, parse JSON safely
@@ -113,13 +114,8 @@ export async function GET(request: NextRequest) {
     try {
       tokenData = JSON.parse(rawTokenBody)
     } catch {
-      const sanitizedBodyPreview = rawTokenBody
-        .replace(/[\r\n\t]+/g, " ")
-        .replace(/[^a-zA-Z0-9\s.,:;_\-/<>=]/g, "")
-        .trim()
-        .slice(0, 150)
       console.error(
-        `[oauth/callback] Token exchange returned non-JSON response. HTTP status: ${tokenRes.status}. Body preview: ${sanitizedBodyPreview}`
+        `[oauth/callback] Token exchange returned non-JSON response. HTTP status: ${tokenRes.status}. category=PARSE_ERROR`
       )
       const redirectUrl = new URL("/", appOrigin)
       redirectUrl.searchParams.set("error", "token_exchange_failed")
@@ -132,14 +128,8 @@ export async function GET(request: NextRequest) {
     }
 
     if (!tokenRes.ok) {
-      const sanitizedError =
-        typeof tokenData?.error_message === "string"
-          ? tokenData.error_message.slice(0, 200)
-          : typeof tokenData?.error?.message === "string"
-          ? tokenData.error.message.slice(0, 200)
-          : "token_exchange_failed"
       console.error(
-        `[oauth/callback] Token exchange failed. HTTP status: ${tokenRes.status}: ${sanitizedError}`
+        `[oauth/callback] Token exchange failed. HTTP status: ${tokenRes.status}. category=HTTP_ERROR`
       )
       const redirectUrl = new URL("/", appOrigin)
       redirectUrl.searchParams.set("error", "token_exchange_failed")
@@ -153,7 +143,7 @@ export async function GET(request: NextRequest) {
 
     if (!tokenData?.access_token || !tokenData?.user_id) {
       console.error(
-        `[oauth/callback] Token exchange response missing required tokens. HTTP status: ${tokenRes.status}`
+        `[oauth/callback] Token exchange response missing required tokens. HTTP status: ${tokenRes.status}. category=MISSING_TOKENS`
       )
       const redirectUrl = new URL("/", appOrigin)
       redirectUrl.searchParams.set("error", "token_exchange_failed")
@@ -168,17 +158,95 @@ export async function GET(request: NextRequest) {
     const shortToken = tokenData.access_token
     const loginUserId = tokenData.user_id.toString()
 
-    // 6. Exchange for Long-Lived Token (60 Days)
-    const longLivedUrl = `https://graph.instagram.com/access_token?grant_type=ig_exchange_token&client_secret=${clientSecret}&access_token=${shortToken}`
-    const longRes = await fetch(longLivedUrl)
-    let longData: any = {}
+    // 6. Exchange for Long-Lived Token (Strictly Required, Up to 60 Days)
+    const longLivedUrl = `https://graph.instagram.com/access_token?grant_type=ig_exchange_token&client_secret=${encodeURIComponent(clientSecret)}&access_token=${encodeURIComponent(shortToken)}`
+
+    let longRes: Response
     try {
-      longData = await longRes.json()
-    } catch {
-      console.warn("[oauth/callback] Long-lived token response was not JSON, falling back to short-lived token")
+      longRes = await fetch(longLivedUrl, {
+        signal: AbortSignal.timeout(10000),
+      })
+    } catch (fetchErr: any) {
+      const isTimeout = fetchErr?.name === "AbortError" || fetchErr?.name === "TimeoutError"
+      const category = isTimeout ? "TIMEOUT" : "FETCH_ERROR"
+      console.error(`[oauth/callback] Long-lived token exchange request failed: category=${category}`)
+      const redirectUrl = new URL("/", appOrigin)
+      redirectUrl.searchParams.set("error", "token_exchange_failed")
+      const res = NextResponse.redirect(redirectUrl, {
+        status: 302,
+        headers: { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+      })
+      clearStateCookie(res)
+      return res
     }
-    const accessToken = longData.access_token || shortToken
-    const expiresIn = longData.expires_in || 5184000
+
+    if (!longRes.ok) {
+      console.error(`[oauth/callback] Long-lived token exchange HTTP failure. Status: ${longRes.status}`)
+      const redirectUrl = new URL("/", appOrigin)
+      redirectUrl.searchParams.set("error", "token_exchange_failed")
+      const res = NextResponse.redirect(redirectUrl, {
+        status: 302,
+        headers: { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+      })
+      clearStateCookie(res)
+      return res
+    }
+
+    let longData: any = null
+    try {
+      const rawLongBody = await longRes.text()
+      longData = JSON.parse(rawLongBody)
+    } catch {
+      console.error("[oauth/callback] Long-lived token response was not valid JSON")
+      const redirectUrl = new URL("/", appOrigin)
+      redirectUrl.searchParams.set("error", "token_exchange_failed")
+      const res = NextResponse.redirect(redirectUrl, {
+        status: 302,
+        headers: { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+      })
+      clearStateCookie(res)
+      return res
+    }
+
+    if (
+      !longData ||
+      typeof longData !== "object" ||
+      Array.isArray(longData) ||
+      typeof longData.access_token !== "string" ||
+      longData.access_token.trim().length === 0
+    ) {
+      console.error("[oauth/callback] Long-lived token exchange missing or invalid access_token")
+      const redirectUrl = new URL("/", appOrigin)
+      redirectUrl.searchParams.set("error", "token_exchange_failed")
+      const res = NextResponse.redirect(redirectUrl, {
+        status: 302,
+        headers: { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+      })
+      clearStateCookie(res)
+      return res
+    }
+
+    const MAX_EXPIRES_IN_SECONDS = 60 * 24 * 60 * 60 // 5,184,000 seconds (60 days)
+    const rawExpiresIn = longData.expires_in
+    if (
+      typeof rawExpiresIn !== "number" ||
+      !Number.isInteger(rawExpiresIn) ||
+      rawExpiresIn <= 0 ||
+      rawExpiresIn > MAX_EXPIRES_IN_SECONDS
+    ) {
+      console.error("[oauth/callback] Long-lived token exchange invalid expires_in:", typeof rawExpiresIn)
+      const redirectUrl = new URL("/", appOrigin)
+      redirectUrl.searchParams.set("error", "token_exchange_failed")
+      const res = NextResponse.redirect(redirectUrl, {
+        status: 302,
+        headers: { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+      })
+      clearStateCookie(res)
+      return res
+    }
+
+    const accessToken = longData.access_token.trim()
+    const expiresIn = rawExpiresIn
 
     // 7. Retrieve Username & IG Professional Account ID
     let username = `user_${loginUserId}`
@@ -186,13 +254,22 @@ export async function GET(request: NextRequest) {
 
     try {
       const meRes = await fetch(
-        `https://graph.instagram.com/v24.0/me?fields=user_id,username,profile_picture_url&access_token=${accessToken}`
+        `https://graph.instagram.com/v24.0/me?fields=user_id,username,profile_picture_url&access_token=${encodeURIComponent(accessToken)}`,
+        { signal: AbortSignal.timeout(10000) }
       )
-      const meData = await meRes.json()
-      if (meData.username) username = meData.username
-      if (meData.user_id) businessAccountId = meData.user_id.toString()
-    } catch (e) {
-      console.error("[oauth/callback] /me profile fetch error:", e)
+      if (meRes.ok) {
+        const meData = await meRes.json()
+        if (typeof meData?.username === "string" && meData.username.trim()) {
+          username = meData.username.trim()
+        }
+        if (typeof meData?.user_id === "string" || typeof meData?.user_id === "number") {
+          businessAccountId = meData.user_id.toString()
+        }
+      }
+    } catch (e: any) {
+      const isTimeout = e?.name === "AbortError" || e?.name === "TimeoutError"
+      const category = isTimeout ? "TIMEOUT" : "FETCH_ERROR"
+      console.error(`[oauth/callback] Profile fetch failed: category=${category}`)
     }
 
     // 8. Upsert User in Supabase
@@ -211,7 +288,7 @@ export async function GET(request: NextRequest) {
       .upsert({ id: loginUserId, ...updates }, { onConflict: "id" })
 
     if (upsertError) {
-      console.error("[oauth/callback] User persistence error:", upsertError)
+      console.error("[oauth/callback] User persistence error code:", (upsertError as any)?.code || "unknown")
       throw upsertError
     }
 
@@ -241,7 +318,9 @@ export async function GET(request: NextRequest) {
 
     return response
   } catch (err: any) {
-    console.error("[oauth/callback] Critical OAuth error:", err?.message || err)
+    const isTimeout = err?.name === "AbortError" || err?.name === "TimeoutError"
+    const category = isTimeout ? "TIMEOUT" : "UNHANDLED_EXCEPTION"
+    console.error(`[oauth/callback] Critical OAuth error: category=${category}`)
     const redirectUrl = new URL("/", appOrigin)
     redirectUrl.searchParams.set("error", "authentication_failed")
     const res = NextResponse.redirect(redirectUrl, {
