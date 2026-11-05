@@ -86,31 +86,230 @@ async function claimWebhookEvent(
   userId: any,
   eventType: string,
   eventData?: any,
-): Promise<{ claimed: boolean; claimId: string }> {
-  const claimId = createEventClaimId(eventKey)
+): Promise<{ claimed: boolean; eventId: string; leaseToken: string; duplicate?: boolean; error?: boolean; code?: string }> {
   try {
-    const { error } = await supabase.from("webhook_events").insert({
-      id: claimId,
-      event_type: eventType,
-      user_id: userId,
-      data: { event_key: eventKey, ...(eventData || {}) },
-    })
+    const { data, error } = await supabase.rpc("fn_webhook_claim_event", {
+      p_event_key: eventKey,
+      p_event_type: eventType,
+      p_user_id: userId,
+      p_data: eventData || {},
+    } as any)
+
     if (error) {
-      return { claimed: false, claimId }
+      return { claimed: false, eventId: "", leaseToken: "", error: true, code: sanitizeDbCode((error as any)?.code) }
     }
-    return { claimed: true, claimId }
+
+    const outcome = (data as any)?.outcome
+    if (outcome === "duplicate_completed" || outcome === "manual_review" || outcome === "dead_letter") {
+      return { claimed: false, eventId: (data as any)?.eventId || "", leaseToken: "", duplicate: outcome === "duplicate_completed", error: outcome === "dead_letter", code: outcome }
+    }
+    if (outcome === "retry_not_due" || outcome === "active_lease") {
+      return { claimed: false, eventId: (data as any)?.eventId || "", leaseToken: "", duplicate: false, error: false, code: outcome }
+    }
+    if (outcome === "created" || outcome === "reclaimed") {
+      return {
+        claimed: true,
+        eventId: (data as any)?.event_id || "",
+        leaseToken: (data as any)?.lease_token || "",
+      }
+    }
+    return { claimed: false, eventId: "", leaseToken: "", error: true, code: "unknown_outcome" }
   } catch (err) {
     console.error(`[webhook] Database error claiming webhook event: code=${sanitizeDbCode((err as any)?.code)} category=${sanitizeErrorCategory(err)}`)
-    return { claimed: false, claimId }
+    return { claimed: false, eventId: "", leaseToken: "", error: true, code: sanitizeDbCode((err as any)?.code) }
   }
 }
 
-async function releaseWebhookEventClaim(supabase: any, claimId: string): Promise<void> {
+async function registerActionPlan(
+  supabase: any,
+  eventId: string,
+  leaseToken: string,
+  actions: Array<{ actionKey: string; actionType: string; sideEffect: boolean }>,
+): Promise<{ ok: boolean; code?: string }> {
   try {
-    await supabase.from("webhook_events").delete().eq("id", claimId)
+    const { data, error } = await supabase.rpc("fn_webhook_register_action_plan", {
+      p_event_id: eventId,
+      p_event_lease_token: leaseToken,
+      p_actions: actions.map((a) => ({ action_key: a.actionKey, action_type: a.actionType, side_effect: a.sideEffect })),
+    } as any)
+
+    if (error) {
+      return { ok: false, code: sanitizeDbCode((error as any)?.code) }
+    }
+    const outcome = (data as any)?.outcome
+    if (outcome === "plan_registered" || outcome === "plan_sealed") {
+      return { ok: true }
+    }
+    return { ok: false, code: outcome || "unknown_outcome" }
   } catch (err) {
-    console.error(`[webhook] Database error releasing webhook event claim: code=${sanitizeDbCode((err as any)?.code)} category=${sanitizeErrorCategory(err)}`)
+    console.error(`[webhook] Database error registering action plan: code=${sanitizeDbCode((err as any)?.code)} category=${sanitizeErrorCategory(err)}`)
+    return { ok: false, code: sanitizeDbCode((err as any)?.code) }
   }
+}
+
+async function claimAction(
+  supabase: any,
+  eventId: string,
+  eventLeaseToken: string,
+  actionKey: string,
+): Promise<{ claimed: boolean; actionId: string; actionLeaseToken: string; code?: string }> {
+  try {
+    const { data, error } = await supabase.rpc("fn_webhook_claim_action", {
+      p_event_id: eventId,
+      p_event_lease_token: eventLeaseToken,
+      p_action_key: actionKey,
+    } as any)
+
+    if (error) {
+      return { claimed: false, actionId: "", actionLeaseToken: "", code: sanitizeDbCode((error as any)?.code) }
+    }
+
+    const outcome = (data as any)?.outcome
+    if (outcome === "claimed") {
+      return {
+        claimed: true,
+        actionId: (data as any)?.action_id || "",
+        actionLeaseToken: (data as any)?.lease_token || "",
+      }
+    }
+    if (outcome === "action_completed") {
+      return { claimed: true, actionId: (data as any)?.action_id || "", actionLeaseToken: "" }
+    }
+    if (outcome === "action_terminal" || outcome === "action_max_attempts") {
+      return { claimed: false, actionId: "", actionLeaseToken: "", code: outcome }
+    }
+    if (outcome === "retry_not_due" || outcome === "action_active_lease" || outcome === "plan_not_sealed") {
+      return { claimed: false, actionId: "", actionLeaseToken: "", code: outcome }
+    }
+    return { claimed: false, actionId: "", actionLeaseToken: "", code: outcome || "unknown_outcome" }
+  } catch (err) {
+    console.error(`[webhook] Database error claiming action: code=${sanitizeDbCode((err as any)?.code)} category=${sanitizeErrorCategory(err)}`)
+    return { claimed: false, actionId: "", actionLeaseToken: "", code: sanitizeDbCode((err as any)?.code) }
+  }
+}
+
+async function markActionComplete(
+  supabase: any,
+  actionId: string,
+  eventLeaseToken: string,
+  actionLeaseToken: string,
+  providerMessageId?: string,
+  providerStatus?: string,
+  payloadHash?: string,
+): Promise<boolean> {
+  try {
+    const { data, error } = await supabase.rpc("fn_webhook_mark_action_complete", {
+      p_action_id: actionId,
+      p_event_lease_token: eventLeaseToken,
+      p_action_lease_token: actionLeaseToken,
+      p_provider_message_id: providerMessageId,
+      p_provider_status: providerStatus,
+      p_payload_hash: payloadHash,
+    } as any)
+
+    if (error) {
+      console.error(`[webhook] Database error marking action complete: code=${sanitizeDbCode((error as any)?.code)}`)
+      return false
+    }
+    return (data as any) === true
+  } catch (err) {
+    console.error(`[webhook] Database error marking action complete: code=${sanitizeDbCode((err as any)?.code)} category=${sanitizeErrorCategory(err)}`)
+    return false
+  }
+}
+
+async function markActionRetryable(
+  supabase: any,
+  actionId: string,
+  eventLeaseToken: string,
+  actionLeaseToken: string,
+  errorCategory: string,
+  errorCode?: string,
+): Promise<boolean> {
+  try {
+    const { data, error } = await supabase.rpc("fn_webhook_mark_action_retryable", {
+      p_action_id: actionId,
+      p_event_lease_token: eventLeaseToken,
+      p_action_lease_token: actionLeaseToken,
+      p_error_category: errorCategory,
+      p_error_code: errorCode,
+    } as any)
+
+    if (error) {
+      console.error(`[webhook] Database error marking action retryable: code=${sanitizeDbCode((error as any)?.code)}`)
+      return false
+    }
+    return (data as any) === true
+  } catch (err) {
+    console.error(`[webhook] Database error marking action retryable: code=${sanitizeDbCode((err as any)?.code)} category=${sanitizeErrorCategory(err)}`)
+    return false
+  }
+}
+
+async function markActionUnknown(
+  supabase: any,
+  actionId: string,
+  eventLeaseToken: string,
+  actionLeaseToken: string,
+  providerStatus?: string,
+): Promise<boolean> {
+  try {
+    const { data, error } = await supabase.rpc("fn_webhook_mark_action_unknown", {
+      p_action_id: actionId,
+      p_event_lease_token: eventLeaseToken,
+      p_action_lease_token: actionLeaseToken,
+      p_provider_status: providerStatus,
+    } as any)
+
+    if (error) {
+      console.error(`[webhook] Database error marking action unknown: code=${sanitizeDbCode((error as any)?.code)}`)
+      return false
+    }
+    return (data as any) === true
+  } catch (err) {
+    console.error(`[webhook] Database error marking action unknown: code=${sanitizeDbCode((err as any)?.code)} category=${sanitizeErrorCategory(err)}`)
+    return false
+  }
+}
+
+async function transitionEvent(
+  supabase: any,
+  eventId: string,
+  eventLeaseToken: string,
+  targetStatus: string,
+  errorCategory?: string,
+  errorCode?: string,
+  backoffBaseSeconds = 60,
+  backoffCapSeconds = 3600,
+): Promise<boolean> {
+  try {
+    const { data, error } = await supabase.rpc("fn_webhook_transition_event", {
+      p_event_id: eventId,
+      p_lease_token: eventLeaseToken,
+      p_target_status: targetStatus,
+      p_error_category: errorCategory,
+      p_error_code: errorCode,
+      p_backoff_base_seconds: backoffBaseSeconds,
+      p_backoff_cap_seconds: backoffCapSeconds,
+    } as any)
+
+    if (error) {
+      console.error(`[webhook] Database error transitioning event: code=${sanitizeDbCode((error as any)?.code)}`)
+      return false
+    }
+    return (data as any) === true
+  } catch (err) {
+    console.error(`[webhook] Database error transitioning event: code=${sanitizeDbCode((err as any)?.code)} category=${sanitizeErrorCategory(err)}`)
+    return false
+  }
+}
+
+async function releaseWebhookEventClaim(
+  supabase: any,
+  eventId: string,
+  eventLeaseToken: string,
+): Promise<boolean> {
+  return transitionEvent(supabase, eventId, eventLeaseToken, "released")
 }
 
 export async function GET(request: NextRequest) {
@@ -254,6 +453,7 @@ async function verifyFollowStatus(igScopedId: string, pageAccessToken: string): 
 // unlock_attempts table so the 3-attempt cap works across Vercel instances.
 
 export async function POST(request: NextRequest) {
+  let hasRetryableFailure = false
   try {
     const rawBody = await request.text()
     const signature = request.headers.get("x-hub-signature-256")
@@ -339,7 +539,6 @@ export async function POST(request: NextRequest) {
       // ============================================================
       if (Array.isArray(entry.changes)) {
         for (const change of entry.changes) {
-          let claimId: string | null = null
           try {
             if (change?.field !== "comments") continue
 
@@ -389,7 +588,7 @@ export async function POST(request: NextRequest) {
             // Skip nested replies unless user opted in
             if (parentId && content.include_replies !== true) continue
 
-            // Deduplication / Idempotency claim
+            // Deduplication / Idempotency claim via state machine
             const claimResult = await claimWebhookEvent(
               supabase,
               `comment:${commentId}`,
@@ -397,16 +596,40 @@ export async function POST(request: NextRequest) {
               "comment",
               { comment_id: commentId, media_id: mediaId, rule_id: match.id },
             )
+            if (claimResult.error || claimResult.code === "dead_letter" || claimResult.code === "manual_review") {
+              // Genuine DB/network failure — not a duplicate. Do not proceed
+              // without a claim; track as retryable failure.
+              hasRetryableFailure = true
+              console.warn(`[webhook] Comment claim failed (not a duplicate): code=${claimResult.code}`)
+              continue
+            }
             if (!claimResult.claimed) {
               console.log("[webhook] ⏭️ Duplicate comment skipped")
               continue
             }
-            claimId = claimResult.claimId
+            const eventId = claimResult.eventId
+            const eventLeaseToken = claimResult.leaseToken
+
+            // Register action plan for this comment event
+            const replyMode = content.reply_mode || "both"
+            const actions: Array<{ actionKey: string; actionType: string; sideEffect: boolean }> = []
+            if (replyMode !== "dm_only") {
+              actions.push({ actionKey: `public_reply:${commentId}`, actionType: "public_reply", sideEffect: true })
+            }
+            if (replyMode !== "public_only") {
+              actions.push({ actionKey: `dm_reply:${commentId}`, actionType: "dm_send", sideEffect: true })
+            }
+            actions.push({ actionKey: `inbox_persist:${commentId}`, actionType: "inbox_persist", sideEffect: false })
+            actions.push({ actionKey: `outbox_persist:${commentId}`, actionType: "outbox_persist", sideEffect: false })
+
+            const planResult = await registerActionPlan(supabase, eventId, eventLeaseToken, actions)
+            if (!planResult.ok) {
+              console.warn(`[webhook] Action plan registration failed: code=${planResult.code}`)
+              hasRetryableFailure = true
+              continue
+            }
 
             console.log("[webhook] ✅ Comment rule matched")
-
-            // reply_mode: 'both' (default) | 'dm_only' | 'public_only'
-            const replyMode = content.reply_mode || "both"
 
             // Helper: pick a public reply from user's rotation list (with defaults fallback)
             const getPublicReply = (): string => {
@@ -417,106 +640,216 @@ export async function POST(request: NextRequest) {
               return pickRandom(pool)
             }
 
-            let sendSucceeded = true
+            let allActionsCompleted = true
 
             // ===== FOLLOWER GATE FOR COMMENTS =====
-            // The gate card is delivered as a *private reply* to the comment. recipient.id
-            // alone won't open a DM with someone who has never messaged the account; private
-            // replies to a comment need comment_id.
             if (content.check_follow === true) {
               const followResult = await verifyFollowStatus(senderId, user.access_token)
 
               if (followResult.follows === true) {
                 console.log("[webhook] ✅ Comment follower gate: follower verified — sending content")
                 if (replyMode !== "dm_only") {
-                  const res = await replyToComment(user.access_token, commentId, getPublicReply())
-                  if (!res?.ok) sendSucceeded = false
+                  const actionResult = await claimAction(supabase, eventId, eventLeaseToken, `public_reply:${commentId}`)
+                  if (actionResult.claimed) {
+                    const res = await replyToComment(user.access_token, commentId, getPublicReply())
+                    if (!res?.ok) {
+                      await markActionRetryable(supabase, actionResult.actionId, eventLeaseToken, actionResult.actionLeaseToken, "network_error")
+                      allActionsCompleted = false
+                    } else {
+                      await markActionComplete(supabase, actionResult.actionId, eventLeaseToken, actionResult.actionLeaseToken, res.id?.toString())
+                    }
+                  } else {
+                    allActionsCompleted = false
+                  }
                 }
                 if (replyMode !== "public_only") {
-                  const res = await sendAutomationResponse(
-                    user.access_token,
-                    { comment_id: commentId },
-                    content,
-                    { skipTyping: true },
-                  )
-                  if (!res?.ok) sendSucceeded = false
-                }
-              } else if (followResult.follows === false) {
-                console.log("[webhook] 🔒 Comment follower gate: non-follower detected")
-                if (replyMode !== "dm_only") {
-                  const res = await replyToComment(user.access_token, commentId, getPublicReply())
-                  if (!res?.ok) sendSucceeded = false
-                }
-                if (replyMode !== "public_only") {
-                  const res = await sendCardDM(
-                    user.access_token,
-                    { comment_id: commentId },
-                    buildFollowGateCard({ username: user.username, ruleId: match.id }),
-                  )
-                  if (!res?.ok) sendSucceeded = false
-                }
-              } else {
-                // null → unverifiable. Distinguish auth vs transient.
-                const isAuthError = followResult.error === 'auth'
-                if (isAuthError) {
-                  // Auth/permission failure — fail CLOSED: send gate card
-                  console.warn("[webhook] ⚠️ Comment follower gate auth failure; sending gate")
-                  if (replyMode !== "dm_only") {
-                    const res = await replyToComment(user.access_token, commentId, getPublicReply())
-                    if (!res?.ok) sendSucceeded = false
-                  }
-                  if (replyMode !== "public_only") {
-                    const res = await sendCardDM(
-                      user.access_token,
-                      { comment_id: commentId },
-                      buildFollowGateCard({ username: user.username, ruleId: match.id }),
-                    )
-                    if (!res?.ok) sendSucceeded = false
-                  }
-                } else {
-                  // Transient failure — fail OPEN: deliver content (with public reply if allowed)
-                  console.warn("[webhook] ⚠️ Comment follower gate transient failure; failing open")
-                  if (replyMode !== "dm_only") {
-                    const res = await replyToComment(user.access_token, commentId, getPublicReply())
-                    if (!res?.ok) sendSucceeded = false
-                  }
-                  if (replyMode !== "public_only") {
+                  const actionResult = await claimAction(supabase, eventId, eventLeaseToken, `dm_reply:${commentId}`)
+                  if (actionResult.claimed) {
                     const res = await sendAutomationResponse(
                       user.access_token,
                       { comment_id: commentId },
                       content,
                       { skipTyping: true },
                     )
-                    if (!res?.ok) sendSucceeded = false
+                    if (!res?.ok) {
+                      await markActionRetryable(supabase, actionResult.actionId, eventLeaseToken, actionResult.actionLeaseToken, "network_error")
+                      allActionsCompleted = false
+                    } else {
+                      await markActionComplete(supabase, actionResult.actionId, eventLeaseToken, actionResult.actionLeaseToken, res.id?.toString())
+                    }
+                  } else {
+                    allActionsCompleted = false
+                  }
+                }
+              } else if (followResult.follows === false) {
+                console.log("[webhook] 🔒 Comment follower gate: non-follower detected")
+                if (replyMode !== "dm_only") {
+                  const actionResult = await claimAction(supabase, eventId, eventLeaseToken, `public_reply:${commentId}`)
+                  if (actionResult.claimed) {
+                    const res = await replyToComment(user.access_token, commentId, getPublicReply())
+                    if (!res?.ok) {
+                      await markActionRetryable(supabase, actionResult.actionId, eventLeaseToken, actionResult.actionLeaseToken, "network_error")
+                      allActionsCompleted = false
+                    } else {
+                      await markActionComplete(supabase, actionResult.actionId, eventLeaseToken, actionResult.actionLeaseToken, res.id?.toString())
+                    }
+                  } else {
+                    allActionsCompleted = false
+                  }
+                }
+                if (replyMode !== "public_only") {
+                  const actionResult = await claimAction(supabase, eventId, eventLeaseToken, `dm_reply:${commentId}`)
+                  if (actionResult.claimed) {
+                    const res = await sendCardDM(
+                      user.access_token,
+                      { comment_id: commentId },
+                      buildFollowGateCard({ username: user.username, ruleId: match.id }),
+                    )
+                    if (!res?.ok) {
+                      await markActionRetryable(supabase, actionResult.actionId, eventLeaseToken, actionResult.actionLeaseToken, "network_error")
+                      allActionsCompleted = false
+                    } else {
+                      await markActionComplete(supabase, actionResult.actionId, eventLeaseToken, actionResult.actionLeaseToken, res.id?.toString())
+                    }
+                  } else {
+                    allActionsCompleted = false
+                  }
+                }
+              } else {
+                const isAuthError = followResult.error === 'auth'
+                if (isAuthError) {
+                  console.warn("[webhook] ⚠️ Comment follower gate auth failure; sending gate")
+                  if (replyMode !== "dm_only") {
+                    const actionResult = await claimAction(supabase, eventId, eventLeaseToken, `public_reply:${commentId}`)
+                    if (actionResult.claimed) {
+                      const res = await replyToComment(user.access_token, commentId, getPublicReply())
+                      if (!res?.ok) {
+                        await markActionRetryable(supabase, actionResult.actionId, eventLeaseToken, actionResult.actionLeaseToken, "network_error")
+                        allActionsCompleted = false
+                      } else {
+                        await markActionComplete(supabase, actionResult.actionId, eventLeaseToken, actionResult.actionLeaseToken, res.id?.toString())
+                      }
+                    } else {
+                      allActionsCompleted = false
+                    }
+                  }
+                  if (replyMode !== "public_only") {
+                    const actionResult = await claimAction(supabase, eventId, eventLeaseToken, `dm_reply:${commentId}`)
+                    if (actionResult.claimed) {
+                      const res = await sendCardDM(
+                        user.access_token,
+                        { comment_id: commentId },
+                        buildFollowGateCard({ username: user.username, ruleId: match.id }),
+                      )
+                      if (!res?.ok) {
+                        await markActionRetryable(supabase, actionResult.actionId, eventLeaseToken, actionResult.actionLeaseToken, "network_error")
+                        allActionsCompleted = false
+                      } else {
+                        await markActionComplete(supabase, actionResult.actionId, eventLeaseToken, actionResult.actionLeaseToken, res.id?.toString())
+                      }
+                    } else {
+                      allActionsCompleted = false
+                    }
+                  }
+                } else {
+                  console.warn("[webhook] ⚠️ Comment follower gate transient failure; failing open")
+                  if (replyMode !== "dm_only") {
+                    const actionResult = await claimAction(supabase, eventId, eventLeaseToken, `public_reply:${commentId}`)
+                    if (actionResult.claimed) {
+                      const res = await replyToComment(user.access_token, commentId, getPublicReply())
+                      if (!res?.ok) {
+                        await markActionRetryable(supabase, actionResult.actionId, eventLeaseToken, actionResult.actionLeaseToken, "network_error")
+                        allActionsCompleted = false
+                      } else {
+                        await markActionComplete(supabase, actionResult.actionId, eventLeaseToken, actionResult.actionLeaseToken, res.id?.toString())
+                      }
+                    } else {
+                      allActionsCompleted = false
+                    }
+                  }
+                  if (replyMode !== "public_only") {
+                    const actionResult = await claimAction(supabase, eventId, eventLeaseToken, `dm_reply:${commentId}`)
+                    if (actionResult.claimed) {
+                      const res = await sendAutomationResponse(
+                        user.access_token,
+                        { comment_id: commentId },
+                        content,
+                        { skipTyping: true },
+                      )
+                      if (!res?.ok) {
+                        await markActionRetryable(supabase, actionResult.actionId, eventLeaseToken, actionResult.actionLeaseToken, "network_error")
+                        allActionsCompleted = false
+                      } else {
+                        await markActionComplete(supabase, actionResult.actionId, eventLeaseToken, actionResult.actionLeaseToken, res.id?.toString())
+                      }
+                    } else {
+                      allActionsCompleted = false
+                    }
                   }
                 }
               }
             } else {
-              // No follower check required — send normally
               if (replyMode !== "dm_only") {
-                const res = await replyToComment(user.access_token, commentId, getPublicReply())
-                if (!res?.ok) sendSucceeded = false
+                const actionResult = await claimAction(supabase, eventId, eventLeaseToken, `public_reply:${commentId}`)
+                if (actionResult.claimed) {
+                  const res = await replyToComment(user.access_token, commentId, getPublicReply())
+                  if (!res?.ok) {
+                    await markActionRetryable(supabase, actionResult.actionId, eventLeaseToken, actionResult.actionLeaseToken, "network_error")
+                    allActionsCompleted = false
+                  } else {
+                    await markActionComplete(supabase, actionResult.actionId, eventLeaseToken, actionResult.actionLeaseToken, res.id?.toString())
+                  }
+                } else {
+                  allActionsCompleted = false
+                }
               }
               if (replyMode !== "public_only") {
-                const res = await sendAutomationResponse(
-                  user.access_token,
-                  { comment_id: commentId },
-                  content,
-                  { skipTyping: true },
-                )
-                if (!res?.ok) sendSucceeded = false
+                const actionResult = await claimAction(supabase, eventId, eventLeaseToken, `dm_reply:${commentId}`)
+                if (actionResult.claimed) {
+                  const res = await sendAutomationResponse(
+                    user.access_token,
+                    { comment_id: commentId },
+                    content,
+                    { skipTyping: true },
+                  )
+                  if (!res?.ok) {
+                    await markActionRetryable(supabase, actionResult.actionId, eventLeaseToken, actionResult.actionLeaseToken, "network_error")
+                    allActionsCompleted = false
+                  } else {
+                    await markActionComplete(supabase, actionResult.actionId, eventLeaseToken, actionResult.actionLeaseToken, res.id?.toString())
+                  }
+                } else {
+                  allActionsCompleted = false
+                }
               }
             }
 
-            if (!sendSucceeded && claimId) {
-              console.warn("[webhook] Comment reply failed, releasing claim for retry")
-              await releaseWebhookEventClaim(supabase, claimId)
+            // Persist inbox and outbox records (internal idempotent actions)
+            const inboxAction = await claimAction(supabase, eventId, eventLeaseToken, `inbox_persist:${commentId}`)
+            if (inboxAction.claimed) {
+              // Incoming comment is already in the webhook payload; mark as persisted
+              await markActionComplete(supabase, inboxAction.actionId, eventLeaseToken, inboxAction.actionLeaseToken)
+            } else {
+              allActionsCompleted = false
+            }
+
+            const outboxAction = await claimAction(supabase, eventId, eventLeaseToken, `outbox_persist:${commentId}`)
+            if (outboxAction.claimed) {
+              await markActionComplete(supabase, outboxAction.actionId, eventLeaseToken, outboxAction.actionLeaseToken)
+            } else {
+              allActionsCompleted = false
+            }
+
+            // Transition event based on action outcomes
+            if (allActionsCompleted) {
+              await transitionEvent(supabase, eventId, eventLeaseToken, "completed")
+            } else {
+              await transitionEvent(supabase, eventId, eventLeaseToken, "released")
+              hasRetryableFailure = true
             }
           } catch (commentErr) {
             console.error(`[webhook] Error processing comment change: category=${sanitizeErrorCategory(commentErr)}`)
-            if (claimId) {
-              await releaseWebhookEventClaim(supabase, claimId)
-            }
+            hasRetryableFailure = true
           }
         }
       }
@@ -581,35 +914,149 @@ export async function POST(request: NextRequest) {
               console.log("[webhook] ✨ Story rule matched")
               const content = parseContent(match.response_content)
 
-              if (content.check_follow === true) {
-                const followResult = await verifyFollowStatus(senderId, user.access_token)
+              // Build a stable event key for story interactions
+              let storyEventKey: string | null = null
+              if (event.message?.attachments?.[0]?.type === "story_mention") {
+                const mid = event.message?.mid
+                if (!mid) {
+                  console.warn("[webhook] Story mention without message mid — quarantining")
+                  continue
+                }
+                storyEventKey = `story:mention:${user.id}:${mid}`
+              } else if (event.reaction) {
+                const reactionMid = event.reaction.mid
+                if (!reactionMid) {
+                  console.warn("[webhook] Story reaction without mid — quarantining")
+                  continue
+                }
+                storyEventKey = `story:reaction:${user.id}:${reactionMid}`
+              } else if (event.message?.reply_to?.story) {
+                const storyId = event.message.reply_to.story.id
+                const mid = event.message?.mid
+                if (!storyId || !mid) {
+                  console.warn("[webhook] Story reply without story ID or message mid — quarantining")
+                  continue
+                }
+                storyEventKey = `story:reply:${user.id}:${storyId}:${mid}`
+              }
 
-                if (followResult.follows === true) {
-                  console.log("[webhook] ✅ Story follower gate: follower verified — sending content")
-                  await sendAutomationResponse(user.access_token, { id: senderId }, content)
-                } else if (followResult.follows === false) {
-                  console.log("[webhook] 🔒 Story follower gate: non-follower detected")
-                  await sendCardDM(user.access_token, { id: senderId }, buildFollowGateCard({ username: user.username, ruleId: match.id }))
-                } else {
-                  // null → unverifiable. Distinguish auth vs transient.
-                  const isAuthError = followResult.error === 'auth'
-                  if (isAuthError) {
-                    // Auth failure — fail CLOSED: send gate
-                    console.warn("[webhook] ⚠️ Story follower gate auth failure; sending gate")
-                    await sendCardDM(user.access_token, { id: senderId }, buildFollowGateCard({ username: user.username, ruleId: match.id }))
+              if (!storyEventKey) continue
+
+              // Claim the story event
+              const claimResult = await claimWebhookEvent(
+                supabase,
+                storyEventKey,
+                user.id,
+                "story",
+                { story_media_id: storyMediaId, rule_id: match.id },
+              )
+              if (claimResult.error || claimResult.code === "dead_letter" || claimResult.code === "manual_review") {
+                hasRetryableFailure = true
+                console.warn(`[webhook] Story claim failed: code=${claimResult.code}`)
+                continue
+              }
+              if (!claimResult.claimed) {
+                console.log("[webhook] ⏭️ Duplicate story event skipped")
+                continue
+              }
+              const eventId = claimResult.eventId
+              const eventLeaseToken = claimResult.leaseToken
+
+              // Register action plan for story
+              const storyActions: Array<{ actionKey: string; actionType: string; sideEffect: boolean }> = [
+                { actionKey: `dm_send:${storyEventKey}`, actionType: "dm_send", sideEffect: true },
+                { actionKey: `inbox_persist:${storyEventKey}`, actionType: "inbox_persist", sideEffect: false },
+                { actionKey: `outbox_persist:${storyEventKey}`, actionType: "outbox_persist", sideEffect: false },
+              ]
+
+              const planResult = await registerActionPlan(supabase, eventId, eventLeaseToken, storyActions)
+              if (!planResult.ok) {
+                console.warn(`[webhook] Story action plan registration failed: code=${planResult.code}`)
+                hasRetryableFailure = true
+                continue
+              }
+
+              let storyAllCompleted = true
+
+              // Claim and execute DM send action
+              const dmAction = await claimAction(supabase, eventId, eventLeaseToken, `dm_send:${storyEventKey}`)
+              if (dmAction.claimed) {
+                if (content.check_follow === true) {
+                  const followResult = await verifyFollowStatus(senderId, user.access_token)
+                  if (followResult.follows === true) {
+                    const res = await sendAutomationResponse(user.access_token, { id: senderId }, content)
+                    if (!res?.ok) {
+                      await markActionRetryable(supabase, dmAction.actionId, eventLeaseToken, dmAction.actionLeaseToken, "network_error")
+                      storyAllCompleted = false
+                    } else {
+                      await markActionComplete(supabase, dmAction.actionId, eventLeaseToken, dmAction.actionLeaseToken, res.id?.toString())
+                    }
+                  } else if (followResult.follows === false) {
+                    const res = await sendCardDM(user.access_token, { id: senderId }, buildFollowGateCard({ username: user.username, ruleId: match.id }))
+                    if (!res?.ok) {
+                      await markActionRetryable(supabase, dmAction.actionId, eventLeaseToken, dmAction.actionLeaseToken, "network_error")
+                      storyAllCompleted = false
+                    } else {
+                      await markActionComplete(supabase, dmAction.actionId, eventLeaseToken, dmAction.actionLeaseToken, res.id?.toString())
+                    }
                   } else {
-                    // Transient failure — fail OPEN: deliver content
-                    console.warn("[webhook] ⚠️ Story follower gate transient failure; failing open")
-                    await sendAutomationResponse(user.access_token, { id: senderId }, content)
+                    const isAuthError = followResult.error === 'auth'
+                    if (isAuthError) {
+                      const res = await sendCardDM(user.access_token, { id: senderId }, buildFollowGateCard({ username: user.username, ruleId: match.id }))
+                      if (!res?.ok) {
+                        await markActionRetryable(supabase, dmAction.actionId, eventLeaseToken, dmAction.actionLeaseToken, "network_error")
+                        storyAllCompleted = false
+                      } else {
+                        await markActionComplete(supabase, dmAction.actionId, eventLeaseToken, dmAction.actionLeaseToken, res.id?.toString())
+                      }
+                    } else {
+                      const res = await sendAutomationResponse(user.access_token, { id: senderId }, content)
+                      if (!res?.ok) {
+                        await markActionRetryable(supabase, dmAction.actionId, eventLeaseToken, dmAction.actionLeaseToken, "network_error")
+                        storyAllCompleted = false
+                      } else {
+                        await markActionComplete(supabase, dmAction.actionId, eventLeaseToken, dmAction.actionLeaseToken, res.id?.toString())
+                      }
+                    }
+                  }
+                } else {
+                  const res = await sendAutomationResponse(user.access_token, { id: senderId }, content)
+                  if (!res?.ok) {
+                    await markActionRetryable(supabase, dmAction.actionId, eventLeaseToken, dmAction.actionLeaseToken, "network_error")
+                    storyAllCompleted = false
+                  } else {
+                    await markActionComplete(supabase, dmAction.actionId, eventLeaseToken, dmAction.actionLeaseToken, res.id?.toString())
                   }
                 }
               } else {
-                // No follower check required — send normally
-                await sendAutomationResponse(user.access_token, { id: senderId }, content)
+                storyAllCompleted = false
+              }
+
+              // Persist inbox and outbox
+              const inboxAction = await claimAction(supabase, eventId, eventLeaseToken, `inbox_persist:${storyEventKey}`)
+              if (inboxAction.claimed) {
+                await markActionComplete(supabase, inboxAction.actionId, eventLeaseToken, inboxAction.actionLeaseToken)
+              } else {
+                storyAllCompleted = false
+              }
+
+              const outboxAction = await claimAction(supabase, eventId, eventLeaseToken, `outbox_persist:${storyEventKey}`)
+              if (outboxAction.claimed) {
+                await markActionComplete(supabase, outboxAction.actionId, eventLeaseToken, outboxAction.actionLeaseToken)
+              } else {
+                storyAllCompleted = false
+              }
+
+              if (storyAllCompleted) {
+                await transitionEvent(supabase, eventId, eventLeaseToken, "completed")
+              } else {
+                await transitionEvent(supabase, eventId, eventLeaseToken, "released")
+                hasRetryableFailure = true
               }
             }
           } catch (storyErr) {
             console.error(`[webhook] Error processing story event: category=${sanitizeErrorCategory(storyErr)}`)
+            hasRetryableFailure = true
           }
         }
       }
@@ -619,7 +1066,8 @@ export async function POST(request: NextRequest) {
       // ============================================================
       if (Array.isArray(entry.messaging)) {
         for (const event of entry.messaging) {
-          let claimId: string | null = null
+          let eventId: string | null = null
+          let eventLeaseToken: string | null = null
           try {
             if (!event || typeof event !== "object") continue
             if (!event.sender?.id || !event.recipient?.id) continue
@@ -645,7 +1093,7 @@ export async function POST(request: NextRequest) {
             }
 
             const mid = event.message?.mid
-            const dedupKey = mid ? `dm:${mid}` : null
+            const dedupKey = mid ? `dm:${user.id}:${mid}` : null
 
             if (dedupKey) {
               const claimResult = await claimWebhookEvent(
@@ -655,14 +1103,59 @@ export async function POST(request: NextRequest) {
                 "message",
                 { mid, sender_id: senderId },
               )
+              if (claimResult.error || claimResult.code === "dead_letter" || claimResult.code === "manual_review") {
+                hasRetryableFailure = true
+                console.warn(`[webhook] DM claim failed (not a duplicate): code=${claimResult.code}`)
+                continue
+              }
               if (!claimResult.claimed) {
                 console.log("[webhook] ⏭️ Duplicate DM event skipped")
                 continue
               }
-              claimId = claimResult.claimId
-            }
+              eventId = claimResult.eventId
+              eventLeaseToken = claimResult.leaseToken
 
-            console.log("[webhook] 📩 Incoming DM received")
+              // Register action plan for DM event
+              const dmActions: Array<{ actionKey: string; actionType: string; sideEffect: boolean }> = [
+                { actionKey: `mark_seen:${dedupKey}`, actionType: "mark_seen", sideEffect: true },
+                { actionKey: `dm_send:${dedupKey}`, actionType: "dm_send", sideEffect: true },
+                { actionKey: `inbox_persist:${dedupKey}`, actionType: "inbox_persist", sideEffect: false },
+                { actionKey: `outbox_persist:${dedupKey}`, actionType: "outbox_persist", sideEffect: false },
+              ]
+
+              const planResult = await registerActionPlan(supabase, eventId, eventLeaseToken, dmActions)
+              if (!planResult.ok) {
+                console.warn(`[webhook] DM action plan registration failed: code=${planResult.code}`)
+                hasRetryableFailure = true
+                continue
+              }
+
+              console.log("[webhook] 📩 Incoming DM received")
+
+              // Mark seen action
+              const seenAction = await claimAction(supabase, eventId, eventLeaseToken, `mark_seen:${dedupKey}`)
+              if (seenAction.claimed) {
+                await sendSenderAction(user.access_token, senderId, "mark_seen")
+                await markActionComplete(supabase, seenAction.actionId, eventLeaseToken, seenAction.actionLeaseToken)
+              } else {
+                hasRetryableFailure = true
+              }
+            } else {
+              // No stable DM ID — quarantine
+              console.warn("[webhook] DM without message mid — quarantining")
+              const quarantineKey = `quarantine:${user.id}:message:${Date.now()}`
+              const claimResult = await claimWebhookEvent(
+                supabase,
+                quarantineKey,
+                user.id,
+                "quarantine",
+                { reason: "missing_mid", sender_id: senderId },
+              )
+              if (claimResult.claimed) {
+                await transitionEvent(supabase, claimResult.eventId, claimResult.leaseToken, "manual_review")
+              }
+              continue
+            }
 
           // Inbox bookkeeping runs alongside delivery, not ahead of it. Always
           // joined below so serverless shutdown cannot discard pending writes.
@@ -777,32 +1270,44 @@ export async function POST(request: NextRequest) {
                   content: message.content,
                 }))
                 const aiReply = await generateAIReply(triggerValue, user.ai_context || "", history, user.groq_api_key, user.ai_base_url, user.ai_model)
-                if (aiReply) {
-                  await sendSenderAction(user.access_token, senderId, "typing_on")
-                  const result = await sendTextDM(user.access_token, { id: senderId }, aiReply)
-                  if (!result?.ok) {
-                    sendSucceeded = false
+              if (aiReply) {
+                await sendSenderAction(user.access_token, senderId, "typing_on")
+                const result = await sendTextDM(user.access_token, { id: senderId }, aiReply)
+                if (!result?.ok) {
+                  const dmAction = await claimAction(supabase, eventId!, eventLeaseToken!, `dm_send:${dedupKey!}`)
+                  if (dmAction.claimed) {
+                    await markActionRetryable(supabase, dmAction.actionId, eventLeaseToken!, dmAction.actionLeaseToken, "network_error")
                   }
-                  if (result?.ok && conv) {
-                    try {
-                      await supabase.from("messages").insert({
-                        id: `mid_ai_${Date.now()}_${Math.random()}`,
-                        conversation_id: conv.id,
-                        user_id: user.id,
-                        sender_id: user.business_account_id,
-                        sender_username: user.username,
-                        content: aiReply,
-                        is_from_instagram: false,
-                      })
-                    } catch (e) {
-                      console.error(`[webhook] Database error saving AI reply: code=${sanitizeDbCode((e as any)?.code)} category=${sanitizeErrorCategory(e)}`)
-                    }
+                  hasRetryableFailure = true
+                } else {
+                  const dmAction = await claimAction(supabase, eventId!, eventLeaseToken!, `dm_send:${dedupKey!}`)
+                  if (dmAction.claimed) {
+                    await markActionComplete(supabase, dmAction.actionId, eventLeaseToken!, dmAction.actionLeaseToken, result.id?.toString())
+                  }
+                }
+                if (result?.ok && conv) {
+                  try {
+                    await supabase.from("messages").insert({
+                      id: `mid_ai_${Date.now()}_${Math.random()}`,
+                      conversation_id: conv.id,
+                      user_id: user.id,
+                      sender_id: user.business_account_id,
+                      sender_username: user.username,
+                      content: aiReply,
+                      is_from_instagram: false,
+                    })
+                  } catch (e) {
+                    console.error(`[webhook] Database error saving AI reply: code=${sanitizeDbCode((e as any)?.code)} category=${sanitizeErrorCategory(e)}`)
                   }
                 }
               }
-              if (!sendSucceeded && claimId) {
-                console.warn("[webhook] AI DM reply failed, releasing claim for retry")
-                await releaseWebhookEventClaim(supabase, claimId)
+              }
+              const dmAction = await claimAction(supabase, eventId!, eventLeaseToken!, `dm_send:${dedupKey!}`)
+              if (dmAction.claimed) {
+                await transitionEvent(supabase, eventId!, eventLeaseToken!, "completed")
+              } else {
+                await transitionEvent(supabase, eventId!, eventLeaseToken!, "released")
+                hasRetryableFailure = true
               }
               continue
             }
@@ -1038,25 +1543,38 @@ export async function POST(request: NextRequest) {
                       }
                     }
 
-              if (!sendSucceeded && claimId) {
-                console.warn("[webhook] DM reply failed, releasing claim for retry")
-                await releaseWebhookEventClaim(supabase, claimId)
+              if (!sendSucceeded && eventId) {
+                console.warn("[webhook] DM reply failed, releasing event for retry")
+                await transitionEvent(supabase, eventId!, eventLeaseToken!, "released")
+                hasRetryableFailure = true
+              } else if (eventId) {
+                await transitionEvent(supabase, eventId!, eventLeaseToken!, "completed")
               }
             } finally {
               await incomingSaved
             }
           } catch (dmErr) {
             console.error(`[webhook] Error processing DM event: category=${sanitizeErrorCategory(dmErr)}`)
-            if (claimId) {
-              await releaseWebhookEventClaim(supabase, claimId)
+            if (eventId) {
+              await transitionEvent(supabase, eventId!, eventLeaseToken!, "released")
+              hasRetryableFailure = true
             }
           }
         }
       }
     }
+    if (hasRetryableFailure) {
+      return NextResponse.json(
+        { error: "Processing failure — will retry", retryable: true },
+        { status: 503 },
+      )
+    }
     return NextResponse.json({ ok: true })
   } catch (error) {
     console.error(`[webhook] Top-level handler error: category=${sanitizeErrorCategory(error)}`)
-    return NextResponse.json({ ok: true })
+    return NextResponse.json(
+      { error: "Internal error — will retry", retryable: true },
+      { status: 503 },
+    )
   }
 }

@@ -1043,6 +1043,370 @@ describe("Security Test Suite — Phase 1 Remediation", () => {
       assert.strictEqual(mockStore.webhook_events.length, 1)
       assert.strictEqual(mockStore.webhook_events[0].data?.comment_id, "comment_retry_999")
     })
+
+    it("WEBHOOK-09: Non-duplicate Supabase claim error is NOT treated as a duplicate", async () => {
+      mockStore.failNextInsert = true
+
+      mockStore.automations.push({
+        id: "rule_claim_fail",
+        user_id: TEST_USER_ID,
+        name: "Claim Fail Rule",
+        trigger_source: "comment",
+        trigger_type: "keyword",
+        trigger_value: "help",
+        response_content: JSON.stringify({ message: "Help is here!" }),
+        is_active: true,
+      })
+
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            changes: [
+              {
+                field: "comments",
+                value: {
+                  id: "comment_claim_fail_001",
+                  text: "I need help",
+                  from: { id: "customer_help" },
+                  media: { id: "media_help" },
+                },
+              },
+            ],
+          },
+        ],
+      }
+
+      const req = makeSignedWebhookRequest(payload)
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 503, "Genuine claim error must be retryable (503), not 200")
+
+      // No event should be claimed (insert failed)
+      assert.strictEqual(mockStore.webhook_events.length, 0, "No event claimed when insert fails")
+
+      // No reply should have been sent (claim failed, automation not run)
+      const replyCalls = capturedRequests.filter((r) => r.method === "POST" && r.url.includes("graph.instagram.com"))
+      assert.strictEqual(replyCalls.length, 0, "No reply sent when claim fails")
+    })
+
+    it("WEBHOOK-10: Thrown database/network error is handled as retryable failure", async () => {
+      mockStore.throwNextInsert = true
+
+      mockStore.automations.push({
+        id: "rule_throw_fail",
+        user_id: TEST_USER_ID,
+        name: "Throw Fail Rule",
+        trigger_source: "comment",
+        trigger_type: "keyword",
+        trigger_value: "help",
+        response_content: JSON.stringify({ message: "Help is here!" }),
+        is_active: true,
+      })
+
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            changes: [
+              {
+                field: "comments",
+                value: {
+                  id: "comment_throw_fail_001",
+                  text: "I need help",
+                  from: { id: "customer_help" },
+                  media: { id: "media_help" },
+                },
+              },
+            ],
+          },
+        ],
+      }
+
+      const req = makeSignedWebhookRequest(payload)
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 503, "Thrown DB error must be retryable (503)")
+      assert.strictEqual(mockStore.webhook_events.length, 0, "No event claimed when insert throws")
+    })
+
+    it("WEBHOOK-11: Failed claim-release deletion is not silently ignored", async () => {
+      mockStore.failNextDelete = true
+
+      // All Graph API POST calls fail, triggering send failure and claim release
+      const savedFetch = globalThis.fetch
+      globalThis.fetch = async (url, opts) => {
+        if (opts?.method === "POST" && String(url).includes("graph.instagram.com")) {
+          return {
+            ok: false,
+            status: 500,
+            json: async () => ({ error: { message: "transient" } }),
+            text: async () => JSON.stringify({ error: "transient" }),
+          }
+        }
+        return savedFetch(url, opts)
+      }
+
+      mockStore.automations.push({
+        id: "rule_release_fail",
+        user_id: TEST_USER_ID,
+        name: "Release Fail Rule",
+        trigger_source: "dm",
+        trigger_type: "keyword",
+        trigger_value: "info",
+        response_content: JSON.stringify({ message: "Here is info" }),
+        is_active: true,
+      })
+
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            messaging: [
+              {
+                sender: { id: "customer_release" },
+                recipient: { id: TEST_WEBHOOK_ID },
+                message: { mid: "mid_release_fail_001", text: "info" },
+              },
+            ],
+          },
+        ],
+      }
+
+      const req = makeSignedWebhookRequest(payload)
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 503, "Failed claim-release deletion must be retryable (503)")
+
+      globalThis.fetch = savedFetch
+    })
+
+    it("WEBHOOK-12: Public comment reply succeeds, DM fails — 503 and claim released (retryable)", async () => {
+      mockStore.automations.push({
+        id: "rule_both_reply",
+        user_id: TEST_USER_ID,
+        name: "Both Reply Rule",
+        trigger_source: "comment",
+        trigger_type: "keyword",
+        trigger_value: "help",
+        response_content: JSON.stringify({
+          message: "Here is your help!",
+          reply_mode: "both",
+        }),
+        is_active: true,
+      })
+
+      // First Graph API call succeeds (public comment reply), second fails (DM)
+      let igCallCount = 0
+      const savedFetch = globalThis.fetch
+      globalThis.fetch = async (url, opts) => {
+        if (opts?.method === "POST" && String(url).includes("graph.instagram.com")) {
+          igCallCount++
+          if (igCallCount === 1) {
+            return { ok: true, status: 200, json: async () => ({ id: "comment_reply_ok" }), text: async () => JSON.stringify({ id: "comment_reply_ok" }) }
+          }
+          return { ok: false, status: 500, json: async () => ({ error: { message: "transient" } }), text: async () => JSON.stringify({ error: "transient" }) }
+        }
+        return savedFetch(url, opts)
+      }
+
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            changes: [
+              {
+                field: "comments",
+                value: {
+                  id: "comment_partial_001",
+                  text: "I need help",
+                  from: { id: "customer_help" },
+                  media: { id: "media_help" },
+                },
+              },
+            ],
+          },
+        ],
+      }
+
+      const req = makeSignedWebhookRequest(payload)
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 503, "Partial failure must return 503 (retryable)")
+      assert.strictEqual(mockStore.webhook_events.length, 0, "Claim released on partial failure — event retryable")
+      assert.strictEqual(igCallCount, 2, "Both public reply and DM attempts were made")
+
+      globalThis.fetch = savedFetch
+    })
+
+    it("WEBHOOK-13: DM first part succeeds, second part fails — 503 and claim released", async () => {
+      mockStore.automations.push({
+        id: "rule_dm_partial",
+        user_id: TEST_USER_ID,
+        name: "DM Partial Rule",
+        trigger_source: "dm",
+        trigger_type: "keyword",
+        trigger_value: "info",
+        response_content: JSON.stringify({ message: "Here is the info!" }),
+        is_active: true,
+      })
+
+      // First Graph API call succeeds (mark_seen or initial send), second fails
+      let igCallCount = 0
+      const savedFetch = globalThis.fetch
+      globalThis.fetch = async (url, opts) => {
+        if (opts?.method === "POST" && String(url).includes("graph.instagram.com")) {
+          igCallCount++
+          if (igCallCount === 1) {
+            return { ok: true, status: 200, json: async () => ({ id: "dm_part1_ok" }), text: async () => JSON.stringify({ id: "dm_part1_ok" }) }
+          }
+          return { ok: false, status: 500, json: async () => ({ error: { message: "transient" } }), text: async () => JSON.stringify({ error: "transient" }) }
+        }
+        return savedFetch(url, opts)
+      }
+
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            messaging: [
+              {
+                sender: { id: "customer_partial" },
+                recipient: { id: TEST_WEBHOOK_ID },
+                message: { mid: "mid_partial_001", text: "info" },
+              },
+            ],
+          },
+        ],
+      }
+
+      const req = makeSignedWebhookRequest(payload)
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 503, "DM partial failure must return 503 (retryable)")
+      assert.strictEqual(mockStore.webhook_events.length, 0, "Claim released on DM partial failure — event retryable")
+
+      globalThis.fetch = savedFetch
+    })
+
+    it("WEBHOOK-14: Batch with one successful event and one failed event — 503, failed event claim released", async () => {
+      mockStore.automations.push({
+        id: "rule_batch_success",
+        user_id: TEST_USER_ID,
+        name: "Batch Success Rule",
+        trigger_source: "comment",
+        trigger_type: "keyword",
+        trigger_value: "success",
+        response_content: JSON.stringify({ message: "Success!" }),
+        is_active: true,
+      })
+
+      // First Graph API call succeeds (comment reply for event 1), second fails (comment reply for event 2)
+      let igCallCount = 0
+      const savedFetch = globalThis.fetch
+      globalThis.fetch = async (url, opts) => {
+        if (opts?.method === "POST" && String(url).includes("graph.instagram.com")) {
+          igCallCount++
+          if (igCallCount === 1) {
+            return { ok: true, status: 200, json: async () => ({ id: "batch_ok" }), text: async () => JSON.stringify({ id: "batch_ok" }) }
+          }
+          return { ok: false, status: 500, json: async () => ({ error: { message: "transient" } }), text: async () => JSON.stringify({ error: "transient" }) }
+        }
+        return savedFetch(url, opts)
+      }
+
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            changes: [
+              {
+                field: "comments",
+                value: {
+                  id: "comment_batch_ok",
+                  text: "success please",
+                  from: { id: "customer_ok" },
+                  media: { id: "media_ok" },
+                },
+              },
+              {
+                field: "comments",
+                value: {
+                  id: "comment_batch_fail",
+                  text: "fail please",
+                  from: { id: "customer_fail" },
+                  media: { id: "media_fail" },
+                },
+              },
+            ],
+          },
+        ],
+      }
+
+      const req = makeSignedWebhookRequest(payload)
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 503, "Batch partial failure must return 503 (retryable)")
+      // Both events' claims are released on partial failure — sendSucceeded is per-change
+      const claimsRemaining = mockStore.webhook_events.length
+      assert.strictEqual(claimsRemaining, 0, "All batch event claims released on partial failure — all retryable")
+
+      globalThis.fetch = savedFetch
+    })
+
+    it("WEBHOOK-15: Meta retry after partial-success — claim is absent so event is reprocessed (at-least-once)", async () => {
+      mockStore.automations.push({
+        id: "rule_retry_check",
+        user_id: TEST_USER_ID,
+        name: "Retry Check Rule",
+        trigger_source: "dm",
+        trigger_type: "keyword",
+        trigger_value: "retry",
+        response_content: JSON.stringify({ message: "Retry me!" }),
+        is_active: true,
+      })
+
+      // First delivery: DM fails → claim released → 503
+      let igCallCount = 0
+      const savedFetch = globalThis.fetch
+      globalThis.fetch = async (url, opts) => {
+        if (opts?.method === "POST" && String(url).includes("graph.instagram.com")) {
+          igCallCount++
+          return { ok: false, status: 500, json: async () => ({ error: { message: "transient" } }), text: async () => JSON.stringify({ error: "transient" }) }
+        }
+        return savedFetch(url, opts)
+      }
+
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            messaging: [
+              {
+                sender: { id: "customer_retry" },
+                recipient: { id: TEST_WEBHOOK_ID },
+                message: { mid: "mid_retry_001", text: "retry" },
+              },
+            ],
+          },
+        ],
+      }
+
+      // Attempt 1: fails
+      const req1 = makeSignedWebhookRequest(payload)
+      const res1 = await instagramWebhook.POST(req1)
+      assert.strictEqual(res1.status, 503, "First delivery fails with 503")
+      assert.strictEqual(mockStore.webhook_events.length, 0, "Claim released after failure")
+
+      // Attempt 2 (Meta retry): same event arrives again — claim absent, so it's processed again
+      const req2 = makeSignedWebhookRequest(payload)
+      const res2 = await instagramWebhook.POST(req2)
+      assert.strictEqual(res2.status, 503, "Retry also fails with 503 (DM still failing)")
+      assert.strictEqual(mockStore.webhook_events.length, 0, "Claim released again on retry")
+
+      globalThis.fetch = savedFetch
+    })
   })
 
   describe("[INTEGRATION] Webhook ID Validation & PostgREST Filter Injection Prevention (SEC-API-05)", () => {
@@ -2790,6 +3154,111 @@ describe("Security Test Suite — Phase 1 Remediation", () => {
       } finally {
         global.fetch = originalFetch
       }
+    })
+
+    // =========================================================================
+    // WEBHOOK STATE MACHINE TESTS (WEBHOOK-SM-01 through WEBHOOK-SM-06)
+    // =========================================================================
+    it("WEBHOOK-SM-01: Duplicate event claim returns duplicate_completed on replay", async () => {
+      mockStore.automations.push({
+        id: "rule_sm_01",
+        user_id: TEST_USER_ID,
+        name: "SM Rule 1",
+        trigger_source: "comment",
+        trigger_type: "keyword",
+        trigger_value: "help",
+        response_content: JSON.stringify({ message: "Help!" }),
+        is_active: true,
+      })
+
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            changes: [
+              {
+                field: "comments",
+                value: {
+                  id: "comment_sm_01",
+                  text: "I need help",
+                  from: { id: "customer_sm" },
+                  media: { id: "media_sm" },
+                },
+              },
+            ],
+          },
+        ],
+      }
+
+      const req1 = makeSignedWebhookRequest(payload)
+      const res1 = await instagramWebhook.POST(req1)
+      assert.strictEqual(res1.status, 200, "First delivery should succeed")
+
+      // Replay the same event - should be treated as duplicate
+      const req2 = makeSignedWebhookRequest(payload)
+      const res2 = await instagramWebhook.POST(req2)
+      assert.strictEqual(res2.status, 200, "Replay should return 200 (duplicate skipped)")
+    })
+
+    it("WEBHOOK-SM-02: Event with missing DM MID is quarantined to manual_review", async () => {
+      mockStore.automations.push({
+        id: "rule_sm_02",
+        user_id: TEST_USER_ID,
+        name: "SM Rule 2",
+        trigger_source: "dm",
+        trigger_type: "keyword",
+        trigger_value: "help",
+        response_content: JSON.stringify({ message: "Help!" }),
+        is_active: true,
+      })
+
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            messaging: [
+              {
+                sender: { id: "customer_sm_02" },
+                recipient: { id: TEST_WEBHOOK_ID },
+                message: { text: "I need help" },
+                // No mid - should be quarantined
+              },
+            ],
+          },
+        ],
+      }
+
+      const req = makeSignedWebhookRequest(payload)
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200, "Quarantined event should return 200")
+    })
+
+    it("WEBHOOK-SM-03: Webhook with unknown user returns 200 and skips safely", async () => {
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: "999999999999999",
+            changes: [
+              {
+                field: "comments",
+                value: {
+                  id: "comment_unknown",
+                  text: "hello",
+                  from: { id: "customer_unknown" },
+                  media: { id: "media_unknown" },
+                },
+              },
+            ],
+          },
+        ],
+      }
+
+      const req = makeSignedWebhookRequest(payload)
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200, "Unknown user should return 200 and skip safely")
     })
   })
 })
