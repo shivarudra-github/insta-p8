@@ -248,7 +248,7 @@ export function CreateRuleForm({ userId, triggerSource, onSuccess, editRule }: C
         body: JSON.stringify(isEditing ? { ...payload, id: editRule!.id } : payload),
       })
       if (res.ok) {
-        toast.success(isEditing ? "Automation updated" : "Automation is live")
+        toast.success(isEditing ? "Automation updated" : "Automation saved and paused")
         onSuccess()
       } else {
         toast.error("Could not save — try again")
@@ -719,13 +719,33 @@ export function CreateRuleForm({ userId, triggerSource, onSuccess, editRule }: C
 
               {/* Plain-text Summary Panel */}
               <div className="rounded-2xl border border-accent-yellow/15 bg-accent-yellow/[0.03] p-5 space-y-2">
-                              <div className="flex items-center gap-2">
-                                <Sparkles className="w-4 h-4 text-accent-yellow-foreground" />
-                                <span className="text-xs font-mono-ui uppercase tracking-widest text-accent-yellow-foreground font-bold">Rule Logic Summary</span>
-                              </div>
-                              <p className="text-xs text-muted-foreground leading-relaxed">
-                                When <span className="text-foreground font-semibold underline decoration-accent-yellow/40 decoration-2">{summary.who}</span>, we will <span className="text-accent-yellow-foreground font-semibold">{summary.what}</span>.
-                              </p>
+                <div className="flex items-center gap-2">
+                  <Sparkles className="w-4 h-4 text-accent-yellow shrink-0" />
+                  <span className="text-xs font-mono-ui uppercase tracking-widest text-white font-bold">Rule Logic Summary</span>
+                </div>
+                <p className="text-xs text-neutral-300 leading-relaxed">
+                  When{" "}
+                  {summary.who.includes('"') ? (
+                    (() => {
+                      const match = summary.who.match(/^(.*?)"(.*?)"(.*)$/)
+                      if (!match) return <span className="text-foreground font-semibold underline decoration-accent-yellow/40 decoration-2">{summary.who}</span>
+                      return (
+                        <>
+                          <span className="text-foreground font-medium">{match[1]}</span>
+                          <span className="font-bold text-accent-yellow underline decoration-accent-yellow/60 decoration-2">
+                            &ldquo;{match[2]}&rdquo;
+                          </span>
+                          {match[3] && <span className="text-foreground font-medium">{match[3]}</span>}
+                        </>
+                      )
+                    })()
+                  ) : (
+                    <span className="text-foreground font-semibold underline decoration-accent-yellow/40 decoration-2">
+                      {summary.who}
+                    </span>
+                  )}
+                  , we will <span className="text-foreground font-semibold">{summary.what}</span>.
+                </p>
               </div>
             </div>
           )}

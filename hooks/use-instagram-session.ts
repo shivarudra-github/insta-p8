@@ -1,72 +1,79 @@
 "use client"
 
-import { useState, useEffect } from "react"
-import { useSearchParams, useRouter } from "next/navigation"
+import { useState, useEffect, useCallback } from "react"
+import { usePathname, useRouter } from "next/navigation"
 
 export function useInstagramSession() {
-    const [username, setUsername] = useState<string | null>(null)
-    const [userId, setUserId] = useState<string | null>(null)
-    const [profilePic, setProfilePic] = useState<string | null>(null)
-    const [isLoading, setIsLoading] = useState(true)
+  const [username, setUsername] = useState<string | null>(null)
+  const [userId, setUserId] = useState<string | null>(null)
+  const [profilePic, setProfilePic] = useState<string | null>(null)
+  const [isLoading, setIsLoading] = useState(true)
 
-    const searchParams = useSearchParams()
-    const router = useRouter()
+  const router = useRouter()
+  const pathname = usePathname()
 
-    useEffect(() => {
-        const code = searchParams.get("code")
+  const syncSession = useCallback(async () => {
+    try {
+      // Authoritative server-side verification of HttpOnly session cookie
+      const res = await fetch("/api/auth/me", {
+        method: "GET",
+        headers: { "Cache-Control": "no-cache" },
+      })
 
-        const handleSession = async () => {
-            // CASE A: New Login from Instagram
-            if (code) {
-                try {
-                    const res = await fetch("/api/instagram/callback", {
-                        method: "POST",
-                        body: JSON.stringify({ code }),
-                    })
-                    const data = await res.json()
-
-                    if (data.success) {
-                        localStorage.setItem("ig_user_id", data.userId)
-                        localStorage.setItem("ig_username", data.username)
-                        if (data.profilePic) localStorage.setItem("ig_profile_pic", data.profilePic)
-
-                        setUserId(data.userId)
-                        setUsername(data.username)
-                        setProfilePic(data.profilePic || null)
-                        // Remove code from URL
-                        router.replace("/dashboard")
-                    }
-                } catch (err) {
-                    console.error("Login failed:", err)
-                }
-            }
-            // CASE B: Restore Session from LocalStorage
-            else {
-                const savedId = localStorage.getItem("ig_user_id")
-                const savedName = localStorage.getItem("ig_username")
-
-                if (savedId && savedName) {
-                    setUserId(savedId)
-                    setUsername(savedName)
-                    setProfilePic(localStorage.getItem("ig_profile_pic"))
-                }
-            }
-            setIsLoading(false)
+      if (res.ok) {
+        const data = await res.json()
+        if (data.authenticated && data.user) {
+          setUserId(data.user.userId)
+          setUsername(data.user.username)
+          // Maintain non-authoritative display cache
+          localStorage.setItem("ig_username", data.user.username)
+          localStorage.setItem("ig_user_id", data.user.userId)
+          setIsLoading(false)
+          return
         }
+      }
 
-        handleSession()
-    }, [searchParams, router])
+      // If unauthenticated, clear local display cache
+      setUserId(null)
+      setUsername(null)
+      setProfilePic(null)
+      localStorage.removeItem("ig_user_id")
+      localStorage.removeItem("ig_username")
+      localStorage.removeItem("ig_profile_pic")
 
-    const logout = () => {
-        localStorage.removeItem("ig_user_id")
-        localStorage.removeItem("ig_username")
-        localStorage.removeItem("ig_profile_pic")
-        document.cookie = "insta_session=; Max-Age=0; path=/;"
-        setUsername(null)
-        setUserId(null)
-        setProfilePic(null)
-        router.push("/")
+      // Redirect if attempting to access protected dashboard routes
+      if (pathname && pathname.startsWith("/dashboard")) {
+        router.replace("/")
+      }
+    } catch (err) {
+      console.error("[useInstagramSession] Session verification error:", err)
+      setUserId(null)
+      setUsername(null)
+    } finally {
+      setIsLoading(false)
     }
+  }, [pathname, router])
 
-    return { userId, username, profilePic, isLoading, logout }
+  useEffect(() => {
+    syncSession()
+  }, [syncSession])
+
+  const logout = async () => {
+    try {
+      // Server-side cookie clearance
+      await fetch("/api/auth/logout", { method: "POST" })
+    } catch (err) {
+      console.error("[useInstagramSession] Logout error:", err)
+    } finally {
+      localStorage.removeItem("ig_user_id")
+      localStorage.removeItem("ig_username")
+      localStorage.removeItem("ig_profile_pic")
+      setUsername(null)
+      setUserId(null)
+      setProfilePic(null)
+      router.push("/")
+    }
+  }
+
+  return { userId, username, profilePic, isLoading, logout, refreshSession: syncSession }
 }

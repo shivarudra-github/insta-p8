@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useCallback } from "react"
 import { useInstagramSession } from "@/hooks/use-instagram-session"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -16,19 +16,41 @@ export function IceBreakersManager() {
     const [saving, setSaving] = useState(false)
     const [fetching, setFetching] = useState(true)
 
-    useEffect(() => {
-        if (!userId) return
-        fetch(`/api/ice-breakers?userId=${userId}`)
-            .then(res => res.json())
-            .then(data => {
-                if (Array.isArray(data)) setBreakers(data)
-                setFetching(false)
-            })
-            .catch(err => {
-                console.error(err)
-                setFetching(false)
-            })
+    const fetchBreakers = useCallback(async (): Promise<IceBreakerRow[] | null> => {
+        if (!userId) return null
+        try {
+            const res = await fetch(`/api/ice-breakers?userId=${userId}`)
+            if (!res.ok) {
+                console.error(`[IceBreakers] Fetch error: category=HTTP_ERROR status=${res.status}`)
+                return null
+            }
+            const data: unknown = await res.json()
+            return Array.isArray(data) ? (data as IceBreakerRow[]) : null
+        } catch {
+            console.error("[IceBreakers] Fetch error: category=NETWORK_ERROR")
+            return null
+        }
     }, [userId])
+
+    useEffect(() => {
+        let active = true
+
+        void fetchBreakers().then((data) => {
+            if (!active) return
+            if (data) setBreakers(data)
+            setFetching(false)
+        })
+
+        return () => {
+            active = false
+        }
+    }, [fetchBreakers])
+
+    const refreshBreakers = async () => {
+        const data = await fetchBreakers()
+        if (data) setBreakers(data)
+        setFetching(false)
+    }
 
     const handleAdd = () => {
         if (breakers.length >= 4) {
@@ -64,45 +86,69 @@ export function IceBreakersManager() {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ userId, iceBreakers: breakers })
             })
-            const data = await res.json()
-            if (data.success) {
-                toast.success("Ice Breakers saved & synced usually!")
-            } else {
-                toast.error("Failed to save")
+
+            let data: any = null
+            try {
+                data = await res.json()
+            } catch {
+                data = null
             }
-        } catch (e) {
-            toast.error("Error saving")
+
+            if (!data || typeof data !== "object" || Array.isArray(data)) {
+                toast.warning("Save result could not be confirmed. Please do not retry immediately.")
+                await refreshBreakers()
+                return
+            }
+
+            if (data.partialSuccess || data.operationUncertain) {
+                toast.warning(
+                    data.warning || "The save result could not be fully confirmed. Please do not retry immediately."
+                )
+                await refreshBreakers()
+            } else if (data.success && data.warning) {
+                toast.warning(data.warning)
+                await refreshBreakers()
+            } else if (data.success) {
+                toast.success("Ice Breakers saved & synced successfully!")
+                await refreshBreakers()
+            } else {
+                toast.error(data.error || "Failed to save Ice Breakers. Please try again.")
+            }
+        } catch {
+            console.error("[IceBreakers] Save error: category=NETWORK_ERROR")
+            toast.warning("Save result could not be confirmed due to a network error. Please do not retry immediately.")
+            await refreshBreakers()
         } finally {
             setSaving(false)
         }
     }
 
     if (isLoading) {
-            return (
-                <div className="p-10 flex justify-center">
-                    <Loader2 className="animate-spin text-accent-yellow-foreground dark:text-accent-yellow" />
-                </div>
-            )
-        }
+        return (
+            <div className="p-10 flex justify-center">
+                <Loader2 className="animate-spin text-accent-yellow-foreground dark:text-accent-yellow" />
+            </div>
+        )
+    }
 
-        if (!userId) {
-            return (
-                <div className="space-y-6 max-w-2xl mx-auto">
-                    <div className="text-center py-10 border border-border rounded-xl text-muted-foreground bg-card">
-                        <p className="text-sm font-medium">Not connected</p>
-                        <p className="text-xs mt-1">Connect your Instagram account to manage Ice Breakers.</p>
-                    </div>
+    if (!userId) {
+        return (
+            <div className="space-y-6 max-w-2xl mx-auto">
+                <div className="text-center py-10 border border-border rounded-xl text-muted-foreground bg-card">
+                    <p className="text-sm font-medium">Not connected</p>
+                    <p className="text-xs mt-1">Connect your Instagram account to manage Ice Breakers.</p>
                 </div>
-            )
-        }
+            </div>
+        )
+    }
 
-        if (fetching && !breakers.length) {
-            return (
-                <div className="p-10 flex justify-center">
-                    <Loader2 className="animate-spin text-accent-yellow-foreground dark:text-accent-yellow" />
-                </div>
-            )
-        }
+    if (fetching && !breakers.length) {
+        return (
+            <div className="p-10 flex justify-center">
+                <Loader2 className="animate-spin text-accent-yellow-foreground dark:text-accent-yellow" />
+            </div>
+        )
+    }
 
     return (
         <div className="space-y-6 max-w-4xl mx-auto">
@@ -182,7 +228,7 @@ export function IceBreakersManager() {
             <div className="bg-muted border border-border p-4 rounded-xl flex gap-3 text-sm text-foreground">
                 <RefreshCw className="w-5 h-5 shrink-0 text-muted-foreground" />
                 <p>
-                    Changes made here are automatically synced to your Instagram Profile. It may take a few minutes for them to appear for all users.
+                    Saving changes updates your database and attempts to sync your Instagram profile. Sync failures are reported separately.
                 </p>
             </div>
         </div>

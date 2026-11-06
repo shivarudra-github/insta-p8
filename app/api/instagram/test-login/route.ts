@@ -1,13 +1,15 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { getSupabaseServerClient } from "@/lib/supabase-server"
+import { SESSION_COOKIE_NAME, createSessionToken, getSessionCookieOptions } from "@/lib/session"
 
 /**
  * POST /api/instagram/test-login
  * Creates a mock user for local development — no Instagram OAuth needed.
+ * Strictly forbidden in production.
  */
-export async function POST(request: NextRequest) {
+export async function POST(_request: NextRequest) {
   try {
-    // Only allow in development
+    // Strictly disallowed in production
     if (process.env.NODE_ENV === "production") {
       return NextResponse.json({ error: "Not available in production" }, { status: 403 })
     }
@@ -43,16 +45,13 @@ export async function POST(request: NextRequest) {
       userId: TEST_USER_ID,
     })
 
-    response.cookies.set(
-      "insta_session",
-      JSON.stringify({ username: TEST_USERNAME, userId: TEST_USER_ID }),
-      {
-        path: "/",
-        maxAge: 60 * 24 * 60 * 60,
-        sameSite: "lax",
-        secure: false,
-      }
-    )
+    // Issue cryptographically signed session cookie in development
+    const sessionToken = createSessionToken({ userId: TEST_USER_ID, username: TEST_USERNAME })
+
+    response.cookies.set(SESSION_COOKIE_NAME, sessionToken, {
+      ...getSessionCookieOptions(),
+      maxAge: 60 * 24 * 60 * 60,
+    })
 
     return response
   } catch (error: any) {

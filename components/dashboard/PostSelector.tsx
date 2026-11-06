@@ -74,16 +74,22 @@ export function PostSelector({
     }
   }, [mode, userId])
 
+  // Synchronize mode and selected media when selectedMediaId prop changes
   useEffect(() => {
     if (selectedMediaId) {
       setMode("specific")
-      if (!currentSelectedMedia && mediaList.length > 0) {
-        const found = mediaList.find((m) => m.id === selectedMediaId)
-        if (found) setCurrentSelectedMedia(found)
-      }
     } else {
-      setMode("all")
       setCurrentSelectedMedia(null)
+    }
+  }, [selectedMediaId])
+
+  // Hydrate selected media item details when mediaList or selectedMediaId changes
+  useEffect(() => {
+    if (selectedMediaId && mediaList.length > 0) {
+      const found = mediaList.find((m) => m.id === selectedMediaId)
+      if (found) {
+        setCurrentSelectedMedia(found)
+      }
     }
   }, [selectedMediaId, mediaList])
 

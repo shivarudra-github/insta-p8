@@ -1,5 +1,6 @@
 "use client"
 
+import { useRef } from "react"
 import { Moon, Sun } from "lucide-react"
 import { flushSync } from "react-dom"
 import { useTheme } from "@/components/theme-provider"
@@ -18,44 +19,64 @@ export function ThemeToggle({ className }: { className?: string }) {
   const { resolvedTheme, toggle } = useTheme()
   const isDark = resolvedTheme === "dark"
 
+  const isTransitioningRef = useRef(false)
+
   const handleToggle = (event: React.MouseEvent<HTMLButtonElement>) => {
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    if (isTransitioningRef.current) return
+
+    // Fall back to immediate toggle if reduced motion is preferred or View Transitions API is unavailable
+    const isReduced = typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    const doc = typeof document !== "undefined" ? (document as Document & {
+      startViewTransition?: (callback: () => Promise<void> | void) => {
+        ready: Promise<void>
+        finished: Promise<void>
+      }
+    }) : null
+
+    if (!doc?.startViewTransition || isReduced) {
       toggle()
       return
     }
 
-    const x = event.clientX
-    const y = event.clientY
-    const radius = Math.hypot(Math.max(x, window.innerWidth - x), Math.max(y, window.innerHeight - y))
-    const circle = document.createElement("span")
-    const size = 20
+    isTransitioningRef.current = true
 
-    Object.assign(circle.style, {
-      position: "fixed",
-      left: `${x - size / 2}px`,
-      top: `${y - size / 2}px`,
-      width: `${size}px`,
-      height: `${size}px`,
-      borderRadius: "9999px",
-      background: isDark ? "#fafafa" : "#090909",
-      pointerEvents: "none",
-      zIndex: "2147483647",
-      transform: "scale(0)",
-    })
-    document.body.appendChild(circle)
-
-    const animation = circle.animate(
-      [{ transform: "scale(0)" }, { transform: `scale(${(radius * 2) / size})` }],
-      { duration: 480, easing: "cubic-bezier(.4, 0, .2, 1)", fill: "forwards" },
+    const rect = event.currentTarget.getBoundingClientRect()
+    const x = event.clientX || rect.left + rect.width / 2
+    const y = event.clientY || rect.top + rect.height / 2
+    const endRadius = Math.hypot(
+      Math.max(x, window.innerWidth - x),
+      Math.max(y, window.innerHeight - y)
     )
 
-    animation.finished.then(() => {
-      flushSync(() => toggle())
-      circle.remove()
-    }).catch(() => {
-      toggle()
-      circle.remove()
+    const transition = doc.startViewTransition(() => {
+      flushSync(() => {
+        toggle()
+      })
     })
+
+    transition.ready
+      .then(() => {
+        const animation = document.documentElement.animate(
+          {
+            clipPath: [
+              `circle(0px at ${x}px ${y}px)`,
+              `circle(${endRadius}px at ${x}px ${y}px)`,
+            ],
+          },
+          {
+            duration: 380,
+            easing: "cubic-bezier(0.4, 0, 0.2, 1)",
+            pseudoElement: "::view-transition-new(root)",
+          }
+        )
+        return animation.finished
+      })
+      .catch(() => {
+        // Fallback: If view transition animation fails, theme was already toggled safely
+      })
+      .finally(() => {
+        isTransitioningRef.current = false
+      })
   }
 
   return (

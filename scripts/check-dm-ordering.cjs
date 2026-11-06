@@ -14,12 +14,12 @@ async function test(matched, profileFails = false) {
     let inserted
     const query = {
       select() { return this }, eq() { return this }, or() { return this },
-      update() { return this }, insert(row) { inserted = row; return this },
+      update() { return this }, insert(row) { inserted = row; return this }, upsert(row) { inserted = row; return this },
       single() { return this },
       then(resolve, reject) {
         let data = null
         if (table === 'users') data = user
-        if (table === 'automations') data = [{ id: 'rule', trigger_source: 'dm', trigger_type: 'keyword', trigger_value: 'price', response_content: { message: '499' } }]
+        if (table === 'automations') data = [{ id: 'rule', name: 'Price Rule', trigger_source: 'dm', trigger_type: 'keyword', trigger_value: 'price', is_active: true, response_content: { message: '499' } }]
         if (table === 'conversations' && inserted) data = { id: 'conv' }
         if (table === 'messages' && inserted) saved.push(inserted)
         return Promise.resolve({ data }).then(resolve, reject)

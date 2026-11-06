@@ -1,6 +1,7 @@
 "use client"
 
 import { useEffect, useState } from "react"
+import Link from "next/link"
 import { useRouter } from "next/navigation"
 import {
   Zap, MessageCircle, Sparkles, ArrowUpRight, Github, Star,
@@ -13,6 +14,8 @@ const GITHUB_URL = "https://github.com/ayuuxh2/insta-p8"
 
 export function LandingPage() {
   const [stars, setStars] = useState<number | null>(null)
+  const [isDevLoggingIn, setIsDevLoggingIn] = useState(false)
+  const [devLoginError, setDevLoginError] = useState<string | null>(null)
   const router = useRouter()
 
   useEffect(() => {
@@ -25,13 +28,39 @@ export function LandingPage() {
   const handleLogin = () => {
     // Instagram Business Login (Instagram API with Instagram Login). client_id must be the
     // Instagram app ID from the Instagram product page, not the parent Meta app ID.
-    window.location.href = `https://www.instagram.com/oauth/authorize?enable_fb_login=0&force_authentication=1&client_id=${process.env.NEXT_PUBLIC_INSTAGRAM_APP_ID}&redirect_uri=${process.env.NEXT_PUBLIC_INSTAGRAM_REDIRECT_URI}&response_type=code&scope=instagram_business_basic%2Cinstagram_business_manage_messages%2Cinstagram_business_manage_comments`
+    window.location.href = "/api/instagram/login"
   }
 
-  const handleTestLogin = () => {
-    localStorage.setItem("ig_user_id", "9999999999")
-    localStorage.setItem("ig_username", "test_creator")
-    router.push("/dashboard")
+  const handleTestLogin = async () => {
+    if (isDevLoggingIn) return
+    setIsDevLoggingIn(true)
+    setDevLoginError(null)
+
+    try {
+      const res = await fetch("/api/instagram/test-login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      })
+
+      const data = await res.json().catch(() => ({}))
+
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || `Login failed (${res.status})`)
+      }
+
+      // Populate display cache only after authoritative server session is established
+      if (data.userId && data.username) {
+        localStorage.setItem("ig_user_id", String(data.userId))
+        localStorage.setItem("ig_username", String(data.username))
+      }
+
+      router.push("/dashboard")
+    } catch (err: any) {
+      console.error("[Dev Login] Error:", err)
+      setDevLoginError(err.message || "Failed to log in with dev account")
+    } finally {
+      setIsDevLoggingIn(false)
+    }
   }
 
   return (
@@ -73,9 +102,11 @@ export function LandingPage() {
           {process.env.NODE_ENV === "development" && (
             <button
               onClick={handleTestLogin}
-              className="font-mono-ui text-xs font-bold text-[#ffe14d] border border-[#ffe14d]/30 rounded-full px-4 py-1.5 hover:bg-[#ffe14d]/10 transition-colors"
+              disabled={isDevLoggingIn}
+              className="font-mono-ui text-xs font-bold text-[#ffe14d] border border-[#ffe14d]/30 rounded-full px-4 py-1.5 hover:bg-[#ffe14d]/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
             >
-              Dev Login
+              {isDevLoggingIn && <Loader2 className="w-3 h-3 animate-spin" />}
+              {isDevLoggingIn ? "Logging in..." : "Dev Login"}
             </button>
           )}
           <button
@@ -118,10 +149,15 @@ export function LandingPage() {
               {process.env.NODE_ENV === "development" && (
                 <button
                   onClick={handleTestLogin}
-                  className="group flex items-center gap-2 font-mono-ui text-sm font-bold text-[#ffe14d] border border-[#ffe14d]/25 px-7 py-4 rounded-full hover:bg-[#ffe14d]/10 active:scale-[0.98] transition-all"
+                  disabled={isDevLoggingIn}
+                  className="group flex items-center gap-2 font-mono-ui text-sm font-bold text-[#ffe14d] border border-[#ffe14d]/25 px-7 py-4 rounded-full hover:bg-[#ffe14d]/10 active:scale-[0.98] transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  <Terminal className="w-4 h-4" />
-                  Dev Login
+                  {isDevLoggingIn ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Terminal className="w-4 h-4" />
+                  )}
+                  {isDevLoggingIn ? "Logging in..." : "Dev Login"}
                 </button>
               )}
               <a
@@ -131,6 +167,11 @@ export function LandingPage() {
                 <Send className="w-4 h-4" />
                 Telegram support
               </a>
+              {devLoginError && (
+                <p className="w-full font-mono-ui text-xs text-red-400 bg-red-950/40 border border-red-800/50 rounded-lg px-3.5 py-2.5 mt-2">
+                  {devLoginError}
+                </p>
+              )}
             </div>
           </div>
         </section>
@@ -208,9 +249,13 @@ export function LandingPage() {
       {/* Footer */}
       <footer className="border-t border-white/[0.08] px-5 md:px-10 py-8 flex flex-col md:flex-row items-center justify-between gap-4">
         <span className="font-mono-ui text-[11px] text-neutral-600">
-          insta-p8 — open-source Instagram automation. MIT licensed.
+          AutoReply Studio — Instagram Automation
         </span>
-        <div className="flex items-center gap-5 font-mono-ui text-[11px] text-neutral-500">
+        <div className="flex flex-wrap items-center gap-5 font-mono-ui text-[11px] text-neutral-500">
+          <Link href="/privacy" className="hover:text-white transition-colors">Privacy Policy</Link>
+          <Link href="/terms" className="hover:text-white transition-colors">Terms of Service</Link>
+          <Link href="/data-deletion" className="hover:text-white transition-colors">Data Deletion</Link>
+          <span className="text-neutral-700">|</span>
           <a href={GITHUB_URL} target="_blank" rel="noreferrer" className="hover:text-white transition-colors">GitHub</a>
           <a href={TELEGRAM_URL} target="_blank" rel="noreferrer" className="hover:text-[#2AABEE] transition-colors">Telegram support</a>
         </div>

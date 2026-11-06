@@ -220,32 +220,16 @@ CREATE INDEX IF NOT EXISTS idx_reels_posts_user_status ON public.reels_posts(use
 CREATE INDEX IF NOT EXISTS idx_unlock_attempts_updated ON public.unlock_attempts(updated_at);
 
 -- ==========================================
--- Storage Bucket: reels
+-- Storage Bucket: reels (private)
 -- ==========================================
 INSERT INTO storage.buckets (id, name, public)
-VALUES ('reels', 'reels', true)
-ON CONFLICT (id) DO UPDATE SET public = true;
+VALUES ('reels', 'reels', false)
+ON CONFLICT (id) DO UPDATE SET public = false;
 
 -- Drop storage policies if they exist to prevent duplicates
 DROP POLICY IF EXISTS "Public Uploads" ON storage.objects;
 DROP POLICY IF EXISTS "Public Viewing" ON storage.objects;
 DROP POLICY IF EXISTS "Public Deletion" ON storage.objects;
-
--- Create policies for storage
-CREATE POLICY "Public Uploads"
-ON storage.objects FOR INSERT
-TO public
-WITH CHECK (bucket_id = 'reels');
-
-CREATE POLICY "Public Viewing"
-ON storage.objects FOR SELECT
-TO public
-USING (bucket_id = 'reels');
-
-CREATE POLICY "Public Deletion"
-ON storage.objects FOR DELETE
-TO public
-USING (bucket_id = 'reels');
 
 -- =========================================================================
 -- SECURITY: Row Level Security (RLS) for public schema tables
