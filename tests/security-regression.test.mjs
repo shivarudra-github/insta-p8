@@ -23,6 +23,7 @@ import {
 } from "../lib/session.ts"
 
 import { validateAiBaseUrl } from "../lib/ai-validation.ts"
+import { sendTextDM } from "../lib/instagram-api.ts"
 
 // Actual Route Handlers (tested with NextRequest)
 import * as authMe from "../app/api/auth/me/route.ts"
@@ -1033,15 +1034,14 @@ describe("Security Test Suite — Phase 1 Remediation", () => {
       // Claim should have been released because send failed
       assert.strictEqual(mockStore.webhook_events.length, 0, "Claim must be released on failure")
 
-      // Attempt 2: succeeds
+      // Attempt 2: succeeds — ambiguous outcomes are NOT retried, so the send is not re-attempted
       shouldFail = false
       const req2 = makeSignedWebhookRequest(payload)
       const res2 = await instagramWebhook.POST(req2)
-      assert.strictEqual(res2.status, 200)
+      assert.strictEqual(res2.status, 503)
 
-      // Claim is now recorded because retry succeeded
-      assert.strictEqual(mockStore.webhook_events.length, 1)
-      assert.strictEqual(mockStore.webhook_events[0].data?.comment_id, "comment_retry_999")
+      // Claim is released again; the ambiguous send is never automatically re-sent
+      assert.strictEqual(mockStore.webhook_events.length, 0, "Claim must be released again; ambiguous send not retried")
     })
 
     it("WEBHOOK-09: Non-duplicate Supabase claim error is NOT treated as a duplicate", async () => {
@@ -1406,6 +1406,472 @@ describe("Security Test Suite — Phase 1 Remediation", () => {
       assert.strictEqual(mockStore.webhook_events.length, 0, "Claim released again on retry")
 
       globalThis.fetch = savedFetch
+    })
+
+    it("WEBHOOK-DM-01: Normal incoming DM automation first send is allowed and dm_send action is claimed+completed", async () => {
+      mockStore.automations.push({
+        id: "rule_dm_first",
+        user_id: TEST_USER_ID,
+        name: "DM First Rule",
+        trigger_source: "dm",
+        trigger_type: "keyword",
+        trigger_value: "info",
+        response_content: JSON.stringify({ message: "Here is the info!" }),
+        is_active: true,
+      })
+
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            messaging: [
+              {
+                sender: { id: "customer_dm_first" },
+                recipient: { id: TEST_WEBHOOK_ID },
+                message: { mid: "mid_dm_first_001", text: "info" },
+              },
+            ],
+          },
+        ],
+      }
+
+      const req = makeSignedWebhookRequest(payload)
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200, "Normal incoming DM first send must be allowed")
+
+      const graphPosts = capturedRequests.filter((r) => r.method === "POST" && r.url.includes("graph.instagram.com"))
+      assert.ok(graphPosts.length > 0, "DM send must call Meta Graph API")
+
+      const dmSendAction = mockStore.webhook_action_ledger.find((a) => a.action_key === "dm_send:dm:99001:mid_dm_first_001")
+      assert.ok(dmSendAction, "dm_send action must be registered")
+      assert.strictEqual(dmSendAction.status, "completed", "dm_send action must be completed after successful send")
+      assert.ok(dmSendAction.provider_message_id, "dm_send action must record a provider message id")
+
+      const event = mockStore.webhook_event_ledger.find((e) => e.event_key === "dm:99001:mid_dm_first_001")
+      assert.ok(event, "event ledger row must exist")
+      assert.strictEqual(event.status, "completed", "event must be completed once every action is done")
+    })
+
+    it("WEBHOOK-DM-02: Completed incoming DM replay produces zero additional DM API calls", async () => {
+      mockStore.automations.push({
+        id: "rule_dm_replay",
+        user_id: TEST_USER_ID,
+        name: "DM Replay Rule",
+        trigger_source: "dm",
+        trigger_type: "keyword",
+        trigger_value: "info",
+        response_content: JSON.stringify({ message: "Here is the info!" }),
+        is_active: true,
+      })
+
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            messaging: [
+              {
+                sender: { id: "customer_dm_replay" },
+                recipient: { id: TEST_WEBHOOK_ID },
+                message: { mid: "mid_dm_replay_001", text: "info" },
+              },
+            ],
+          },
+        ],
+      }
+
+      // First delivery
+      const req1 = makeSignedWebhookRequest(payload)
+      const res1 = await instagramWebhook.POST(req1)
+      assert.strictEqual(res1.status, 200, "First DM delivery must be allowed")
+
+      const initialCallCount = capturedRequests.filter((r) => r.method === "POST" && r.url.includes("graph.instagram.com")).length
+      assert.ok(initialCallCount > 0, "First DM must send at least one Graph API call")
+
+      // Replay of the same completed DM must not send again
+      const req2 = makeSignedWebhookRequest(payload)
+      const res2 = await instagramWebhook.POST(req2)
+      assert.strictEqual(res2.status, 200, "Duplicate DM replay must return 200")
+
+      const totalCallCount = capturedRequests.filter((r) => r.method === "POST" && r.url.includes("graph.instagram.com")).length
+      assert.strictEqual(totalCallCount, initialCallCount, "Completed DM replay must produce zero additional DM API calls")
+
+      const dmSendActions = mockStore.webhook_action_ledger.filter((a) => a.action_key === "dm_send:dm:99001:mid_dm_replay_001")
+      assert.strictEqual(dmSendActions.length, 1, "dm_send action must not be duplicated on replay")
+    })
+
+    it("WEBHOOK-DM-03: DM automation in dm_only mode sends and claims the dm_send action", async () => {
+      mockStore.automations.push({
+        id: "rule_dm_only",
+        user_id: TEST_USER_ID,
+        name: "DM Only Rule",
+        trigger_source: "dm",
+        trigger_type: "keyword",
+        trigger_value: "info",
+        response_content: JSON.stringify({ message: "DM only response", reply_mode: "dm_only" }),
+        is_active: true,
+      })
+
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            messaging: [
+              {
+                sender: { id: "customer_dm_only" },
+                recipient: { id: TEST_WEBHOOK_ID },
+                message: { mid: "mid_dm_only_001", text: "info" },
+              },
+            ],
+          },
+        ],
+      }
+
+      const req = makeSignedWebhookRequest(payload)
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200, "dm_only DM automation must send")
+
+      const dmSendAction = mockStore.webhook_action_ledger.find((a) => a.action_key === "dm_send:dm:99001:mid_dm_only_001")
+      assert.ok(dmSendAction, "dm_send action must be registered in dm_only mode")
+      assert.strictEqual(dmSendAction.status, "completed", "dm_send action must be completed in dm_only mode")
+    })
+
+    it("WEBHOOK-DM-04: Follower-gate DM reply cannot bypass the dm_send action claim", async () => {
+      mockStore.automations.push({
+        id: "rule_dm_gate",
+        user_id: TEST_USER_ID,
+        name: "DM Follower Gate",
+        trigger_source: "dm",
+        trigger_type: "keyword",
+        trigger_value: "info",
+        response_content: JSON.stringify({ message: "Gated content", check_follow: true }),
+        is_active: true,
+      })
+
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            messaging: [
+              {
+                sender: { id: "customer_dm_gate" },
+                recipient: { id: TEST_WEBHOOK_ID },
+                message: { mid: "mid_dm_gate_001", text: "info" },
+              },
+            ],
+          },
+        ],
+      }
+
+      const req = makeSignedWebhookRequest(payload)
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200, "Follower-gate DM must be delivered when follower verified")
+
+      const followCheck = capturedRequests.some((r) => r.url.includes("is_user_follow_business"))
+      assert.ok(followCheck, "Follower gate must verify follow status via Graph API")
+
+      const dmSendAction = mockStore.webhook_action_ledger.find((a) => a.action_key === "dm_send:dm:99001:mid_dm_gate_001")
+      assert.ok(dmSendAction, "dm_send action must be claimed for follower-gate delivery")
+      assert.strictEqual(dmSendAction.status, "completed", "dm_send action must be completed for follower-gate delivery")
+    })
+
+    it("WEBHOOK-DM-05: Postback DM reply cannot bypass the dm_send action claim", async () => {
+      mockStore.automations.push({
+        id: "rule_dm_postback",
+        user_id: TEST_USER_ID,
+        name: "DM Postback Rule",
+        trigger_source: "dm",
+        trigger_type: "postback",
+        trigger_value: "GET_STARTED",
+        response_content: JSON.stringify({ message: "Welcome via postback!" }),
+        is_active: true,
+      })
+
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            messaging: [
+              {
+                sender: { id: "customer_dm_postback" },
+                recipient: { id: TEST_WEBHOOK_ID },
+                timestamp: 1,
+                message: { mid: "mid_dm_postback_001" },
+                postback: { payload: "GET_STARTED" },
+              },
+            ],
+          },
+        ],
+      }
+
+      const req = makeSignedWebhookRequest(payload)
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200, "Postback DM must be delivered")
+
+      const dmSendAction = mockStore.webhook_action_ledger.find((a) => a.action_key === "dm_send:dm:99001:mid_dm_postback_001")
+      assert.ok(dmSendAction, "dm_send action must be claimed for postback delivery")
+      assert.strictEqual(dmSendAction.status, "completed", "dm_send action must be completed for postback delivery")
+    })
+  })
+
+  describe("[INTEGRATION] Webhook DM Multi-Message Idempotency (WEBHOOK-DM-MULTI)", () => {
+    const TEST_USER_ID = "99001"
+    const TEST_WEBHOOK_ID = "99002"
+    let originalFetch
+    let capturedRequests
+
+    function makeSignedWebhookRequest(payloadObj) {
+      const payloadStr = JSON.stringify(payloadObj)
+      const sig = "sha256=" + crypto.createHmac("sha256", "test_meta_app_secret_456").update(payloadStr).digest("hex")
+      return new NextRequest("http://localhost:3000/api/instagram/webhook", {
+        method: "POST",
+        headers: { "x-hub-signature-256": sig, "Content-Type": "application/json" },
+        body: payloadStr,
+      })
+    }
+
+    beforeEach(() => {
+      resetMockStore()
+      capturedRequests = []
+      originalFetch = globalThis.fetch
+      mockStore.users.push({
+        id: TEST_USER_ID,
+        business_account_id: TEST_WEBHOOK_ID,
+        page_id: "99003",
+        username: "testcreator",
+        access_token: "test_token_valid_123",
+        groq_auto_reply_enabled: false,
+      })
+      globalThis.fetch = async (url, opts) => {
+        const urlStr = String(url)
+        const bodyStr = opts?.body ? (typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body)) : null
+        capturedRequests.push({ url: urlStr, method: opts?.method || "GET", body: bodyStr })
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: "mock_resp_123", is_user_follow_business: true, username: "fan_account" }),
+          text: async () => JSON.stringify({ id: "mock_resp_123" }),
+        }
+      }
+    })
+
+    afterEach(() => {
+      globalThis.fetch = originalFetch
+    })
+
+    function configureFetch({ media, text }) {
+      globalThis.fetch = async (url, opts) => {
+        const urlStr = String(url)
+        const bodyStr = opts?.body ? (typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body)) : null
+        capturedRequests.push({ url: urlStr, method: opts?.method || "GET", body: bodyStr })
+        if (bodyStr && bodyStr.includes("attachment")) return media()
+        if (bodyStr && bodyStr.includes('"text"') && !bodyStr.includes("attachment")) return text()
+        // mark_seen sender_action and profile fetches are not message sends.
+        return { ok: true, status: 200, json: async () => ({}), text: async () => "{}" }
+      }
+    }
+
+    function graphPosts() {
+      return capturedRequests.filter((r) => r.method === "POST" && r.url.includes("graph.instagram.com"))
+    }
+    function mediaSends() {
+      return graphPosts().filter((r) => r.body && r.body.includes("attachment"))
+    }
+    function textSends() {
+      return graphPosts().filter((r) => r.body && r.body.includes('"text"') && !r.body.includes("attachment"))
+    }
+
+    function successResponse(id) {
+      return { ok: true, status: 200, json: async () => ({ id }), text: async () => JSON.stringify({ id }) }
+    }
+
+    function ambiguousResponse() {
+      return { ok: true, status: 200, json: async () => ({ error: "uncertain_server" }), text: async () => JSON.stringify({ error: "uncertain_server" }) }
+    }
+
+    function rejection429Response() {
+      return { ok: false, status: 429, json: async () => ({ error: "rate_limited" }), text: async () => JSON.stringify({ error: "rate_limited" }) }
+    }
+
+    const mediaContent = JSON.stringify({ media: { url: "https://example.com/img.png", type: "image" }, message: "Here is media and text!" })
+
+    it("WEBHOOK-DM-MULTI-A: media success, then text success — both actions completed exactly once, replay sends zero", async () => {
+      mockStore.automations.push({
+        id: "rule_dm_multi_a",
+        user_id: TEST_USER_ID,
+        name: "DM Multi A",
+        trigger_source: "dm",
+        trigger_type: "keyword",
+        trigger_value: "media",
+        response_content: mediaContent,
+        is_active: true,
+      })
+
+      configureFetch({ media: () => successResponse("media_msg_id_1"), text: () => successResponse("text_msg_id_1") })
+
+      const payload = {
+        object: "instagram",
+        entry: [{ id: TEST_WEBHOOK_ID, messaging: [{ sender: { id: "customer_dm_multi_a" }, recipient: { id: TEST_WEBHOOK_ID }, message: { mid: "mid_dm_multi_a_001", text: "media" } }] }],
+      }
+
+      const req = makeSignedWebhookRequest(payload)
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200, "media+text delivery must be allowed")
+
+      assert.strictEqual(mediaSends().length, 1, "media must make exactly one Graph API call")
+      assert.strictEqual(textSends().length, 1, "text must make exactly one Graph API call")
+
+      const mediaAction = mockStore.webhook_action_ledger.find((a) => a.action_key === "dm_send_media:dm:99001:mid_dm_multi_a_001")
+      const textAction = mockStore.webhook_action_ledger.find((a) => a.action_key === "dm_send_text:dm:99001:mid_dm_multi_a_001")
+      assert.ok(mediaAction, "dm_send_media action must be registered")
+      assert.strictEqual(mediaAction.status, "completed", "media action must be completed exactly once")
+      assert.ok(mediaAction.provider_message_id, "media action must record a provider message id")
+      assert.ok(textAction, "dm_send_text action must be registered")
+      assert.strictEqual(textAction.status, "completed", "text action must be completed exactly once")
+      assert.ok(textAction.provider_message_id, "text action must record a provider message id")
+
+      const event = mockStore.webhook_event_ledger.find((e) => e.event_key === "dm:99001:mid_dm_multi_a_001")
+      assert.ok(event, "event ledger row must exist")
+      assert.strictEqual(event.status, "completed", "event must be completed once every action is done")
+
+      const req2 = makeSignedWebhookRequest(payload)
+      const res2 = await instagramWebhook.POST(req2)
+      assert.strictEqual(res2.status, 200, "replay must return 200")
+      assert.strictEqual(mediaSends().length, 1, "replay must not resend media")
+      assert.strictEqual(textSends().length, 1, "replay must not resend text")
+    })
+
+    it("WEBHOOK-DM-MULTI-B: media success, then ambiguous text — media stays completed, text becomes unknown, replay sends neither", async () => {
+      mockStore.automations.push({
+        id: "rule_dm_multi_b",
+        user_id: TEST_USER_ID,
+        name: "DM Multi B",
+        trigger_source: "dm",
+        trigger_type: "keyword",
+        trigger_value: "media",
+        response_content: mediaContent,
+        is_active: true,
+      })
+
+      configureFetch({ media: () => successResponse("media_msg_id_2"), text: ambiguousResponse })
+
+      const payload = {
+        object: "instagram",
+        entry: [{ id: TEST_WEBHOOK_ID, messaging: [{ sender: { id: "customer_dm_multi_b" }, recipient: { id: TEST_WEBHOOK_ID }, message: { mid: "mid_dm_multi_b_001", text: "media" } }] }],
+      }
+
+      const req = makeSignedWebhookRequest(payload)
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 503, "unresolved text action must signal retryable failure")
+
+      const mediaAction = mockStore.webhook_action_ledger.find((a) => a.action_key === "dm_send_media:dm:99001:mid_dm_multi_b_001")
+      const textAction = mockStore.webhook_action_ledger.find((a) => a.action_key === "dm_send_text:dm:99001:mid_dm_multi_b_001")
+      assert.ok(mediaAction, "media action must be registered")
+      assert.strictEqual(mediaAction.status, "completed", "media action must stay completed")
+      assert.strictEqual(textAction.status, "unknown", "text action must become unknown on ambiguous provider result")
+
+      const event = mockStore.webhook_event_ledger.find((e) => e.event_key === "dm:99001:mid_dm_multi_b_001")
+      assert.strictEqual(event.status, "released", "event must be released while text action is unresolved")
+
+      const mediaSendsBefore = mediaSends().length
+      const textSendsBefore = textSends().length
+      const req2 = makeSignedWebhookRequest(payload)
+      const res2 = await instagramWebhook.POST(req2)
+      assert.strictEqual(res2.status, 503, "replay with unresolved text action must signal retryable failure")
+      assert.strictEqual(mediaSends().length, mediaSendsBefore, "replay must not resend media")
+      assert.strictEqual(textSends().length, textSendsBefore, "replay must not resend text automatically")
+    })
+
+    it("WEBHOOK-DM-MULTI-C: media success, then confirmed text rejection (429) — media stays completed, text retryable, retry sends text only", async () => {
+      mockStore.automations.push({
+        id: "rule_dm_multi_c",
+        user_id: TEST_USER_ID,
+        name: "DM Multi C",
+        trigger_source: "dm",
+        trigger_type: "keyword",
+        trigger_value: "media",
+        response_content: mediaContent,
+        is_active: true,
+      })
+
+      configureFetch({ media: () => successResponse("media_msg_id_3"), text: rejection429Response })
+
+      const payload = {
+        object: "instagram",
+        entry: [{ id: TEST_WEBHOOK_ID, messaging: [{ sender: { id: "customer_dm_multi_c" }, recipient: { id: TEST_WEBHOOK_ID }, message: { mid: "mid_dm_multi_c_001", text: "media" } }] }],
+      }
+
+      const req = makeSignedWebhookRequest(payload)
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 503, "confirmed rejection must signal retryable failure")
+
+      const mediaAction = mockStore.webhook_action_ledger.find((a) => a.action_key === "dm_send_media:dm:99001:mid_dm_multi_c_001")
+      const textAction = mockStore.webhook_action_ledger.find((a) => a.action_key === "dm_send_text:dm:99001:mid_dm_multi_c_001")
+      assert.strictEqual(mediaAction.status, "completed", "media action must stay completed")
+      assert.strictEqual(textAction.status, "retryable", "text action must become retryable on confirmed 429 rejection")
+
+      const mediaSendsBefore = mediaSends().length
+      const textSendsBefore = textSends().length
+      assert.strictEqual(mediaSendsBefore, 1, "media must make exactly one Graph API call")
+      assert.strictEqual(textSendsBefore, 1, "text must make exactly one Graph API call")
+
+      // Eligible retry: same event arrives again; only text may be re-sent.
+      configureFetch({ media: () => successResponse("unused_retry"), text: () => successResponse("text_msg_id_3_retry") })
+      const req2 = makeSignedWebhookRequest(payload)
+      const res2 = await instagramWebhook.POST(req2)
+      assert.strictEqual(res2.status, 200, "retry must be allowed once text completes")
+
+      assert.strictEqual(mediaSends().length, mediaSendsBefore, "retry must not resend media")
+      assert.strictEqual(textSends().length, textSendsBefore + 1, "retry must send text only (one additional Graph API call)")
+
+      const textActionAfter = mockStore.webhook_action_ledger.find((a) => a.action_key === "dm_send_text:dm:99001:mid_dm_multi_c_001")
+      assert.strictEqual(textActionAfter.status, "completed", "text action must complete on retry")
+    })
+
+    it("WEBHOOK-DM-MULTI-D: ambiguous media — media becomes unknown, text is not sent, replay sends neither", async () => {
+      mockStore.automations.push({
+        id: "rule_dm_multi_d",
+        user_id: TEST_USER_ID,
+        name: "DM Multi D",
+        trigger_source: "dm",
+        trigger_type: "keyword",
+        trigger_value: "media",
+        response_content: mediaContent,
+        is_active: true,
+      })
+
+      configureFetch({ media: ambiguousResponse, text: () => successResponse("unused") })
+
+      const payload = {
+        object: "instagram",
+        entry: [{ id: TEST_WEBHOOK_ID, messaging: [{ sender: { id: "customer_dm_multi_d" }, recipient: { id: TEST_WEBHOOK_ID }, message: { mid: "mid_dm_multi_d_001", text: "media" } }] }],
+      }
+
+      const req = makeSignedWebhookRequest(payload)
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 503, "ambiguous media must signal retryable failure")
+
+      const mediaAction = mockStore.webhook_action_ledger.find((a) => a.action_key === "dm_send_media:dm:99001:mid_dm_multi_d_001")
+      const textAction = mockStore.webhook_action_ledger.find((a) => a.action_key === "dm_send_text:dm:99001:mid_dm_multi_d_001")
+      assert.strictEqual(mediaAction.status, "unknown", "media action must become unknown on ambiguous result")
+      assert.strictEqual(textAction.status, "completed", "text action must be resolved (no-op) without being sent")
+      const mediaSendsBefore = mediaSends().length
+      const textSendsBefore = textSends().length
+      assert.strictEqual(mediaSendsBefore, 1, "only the media attempt must call Graph API")
+      assert.strictEqual(textSendsBefore, 0, "text must not be sent when media is ambiguous")
+
+      const event = mockStore.webhook_event_ledger.find((e) => e.event_key === "dm:99001:mid_dm_multi_d_001")
+      assert.strictEqual(event.status, "released", "event must be released while media action is unknown")
+
+      const req2 = makeSignedWebhookRequest(payload)
+      const res2 = await instagramWebhook.POST(req2)
+      assert.strictEqual(res2.status, 503, "replay with unknown media must signal retryable failure")
+      assert.strictEqual(mediaSends().length, mediaSendsBefore, "replay must not resend media")
+      assert.strictEqual(textSends().length, textSendsBefore, "replay must not resend text automatically")
     })
   })
 
@@ -3156,9 +3622,56 @@ describe("Security Test Suite — Phase 1 Remediation", () => {
       }
     })
 
-    // =========================================================================
-    // WEBHOOK STATE MACHINE TESTS (WEBHOOK-SM-01 through WEBHOOK-SM-06)
-    // =========================================================================
+  })
+
+  // =========================================================================
+  // WEBHOOK STATE MACHINE TESTS (WEBHOOK-SM-01 through WEBHOOK-SM-07)
+  // =========================================================================
+  describe("[INTEGRATION] Webhook State Machine V6", () => {
+    const TEST_USER_ID = "99001"
+    const TEST_WEBHOOK_ID = "99002"
+
+    function makeSignedWebhookRequest(payloadObj) {
+      const payloadStr = JSON.stringify(payloadObj)
+      const sig = "sha256=" + crypto.createHmac("sha256", "test_meta_app_secret_456").update(payloadStr).digest("hex")
+      return new NextRequest("http://localhost:3000/api/instagram/webhook", {
+        method: "POST",
+        headers: { "x-hub-signature-256": sig, "Content-Type": "application/json" },
+        body: payloadStr,
+      })
+    }
+
+    let originalFetch
+
+    beforeEach(() => {
+      resetMockStore()
+      originalFetch = globalThis.fetch
+      mockStore.users.push({
+        id: TEST_USER_ID,
+        business_account_id: TEST_WEBHOOK_ID,
+        page_id: "99003",
+        access_token: "test_token_user_99001",
+      })
+
+      globalThis.fetch = async (url, opts) => {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            id: "mock_comment_reply_id_123",
+            message_id: "mock_dm_msg_id_456",
+            recipient_id: "customer_456",
+            is_user_follow_business: true,
+          }),
+          text: async () => JSON.stringify({ id: "mock_reply_id" }),
+        }
+      }
+    })
+
+    afterEach(() => {
+      globalThis.fetch = originalFetch
+    })
+
     it("WEBHOOK-SM-01: Duplicate event claim returns duplicate_completed on replay", async () => {
       mockStore.automations.push({
         id: "rule_sm_01",
@@ -3260,5 +3773,850 @@ describe("Security Test Suite — Phase 1 Remediation", () => {
       const res = await instagramWebhook.POST(req)
       assert.strictEqual(res.status, 200, "Unknown user should return 200 and skip safely")
     })
+
+    it("WEBHOOK-SM-04: Comment automation with public_only mode registers and claims only public reply", async () => {
+      mockStore.automations.push({
+        id: "rule_sm_04",
+        user_id: TEST_USER_ID,
+        name: "Public Only Rule",
+        trigger_source: "comment",
+        trigger_type: "keyword",
+        trigger_value: "public",
+        response_content: JSON.stringify({ message: "Public response only", reply_mode: "public_only" }),
+        is_active: true,
+      })
+
+      const commentId = "comment_sm_04_" + Date.now()
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            changes: [
+              {
+                field: "comments",
+                value: {
+                  id: commentId,
+                  text: "give me public info",
+                  from: { id: "customer_sm_04" },
+                  media: { id: "media_sm_04" },
+                },
+              },
+            ],
+          },
+        ],
+      }
+
+      const req = makeSignedWebhookRequest(payload)
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200)
+
+      const actions = mockStore.webhook_action_ledger.filter((a) => a.action_key.includes(commentId))
+      const hasPublic = actions.some((a) => a.action_type === "public_reply")
+      const hasDm = actions.some((a) => a.action_type === "dm_send")
+      assert.strictEqual(hasPublic, true, "Public reply action should be planned")
+      assert.strictEqual(hasDm, false, "DM action should NOT be planned in public_only mode")
+    })
+
+    it("WEBHOOK-SM-05: Comment automation with dm_only mode registers and claims only DM reply", async () => {
+      mockStore.automations.push({
+        id: "rule_sm_05",
+        user_id: TEST_USER_ID,
+        name: "DM Only Rule",
+        trigger_source: "comment",
+        trigger_type: "keyword",
+        trigger_value: "private",
+        response_content: JSON.stringify({ message: "DM response only", reply_mode: "dm_only" }),
+        is_active: true,
+      })
+
+      const commentId = "comment_sm_05_" + Date.now()
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            changes: [
+              {
+                field: "comments",
+                value: {
+                  id: commentId,
+                  text: "send private info",
+                  from: { id: "customer_sm_05" },
+                  media: { id: "media_sm_05" },
+                },
+              },
+            ],
+          },
+        ],
+      }
+
+      const req = makeSignedWebhookRequest(payload)
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200)
+
+      const actions = mockStore.webhook_action_ledger.filter((a) => a.action_key.includes(commentId))
+      const hasPublic = actions.some((a) => a.action_type === "public_reply")
+      const hasDm = actions.some((a) => a.action_type === "dm_send")
+      assert.strictEqual(hasPublic, false, "Public reply should NOT be planned in dm_only mode")
+      assert.strictEqual(hasDm, true, "DM action should be planned in dm_only mode")
+    })
+
+    it("WEBHOOK-SM-06: Comment automation with both mode registers and executes both public and DM replies", async () => {
+      mockStore.automations.push({
+        id: "rule_sm_06",
+        user_id: TEST_USER_ID,
+        name: "Both Rule",
+        trigger_source: "comment",
+        trigger_type: "keyword",
+        trigger_value: "combo",
+        response_content: JSON.stringify({ message: "Combo response", reply_mode: "both" }),
+        is_active: true,
+      })
+
+      const commentId = "comment_sm_06_" + Date.now()
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            changes: [
+              {
+                field: "comments",
+                value: {
+                  id: commentId,
+                  text: "send combo deal",
+                  from: { id: "customer_sm_06" },
+                  media: { id: "media_sm_06" },
+                },
+              },
+            ],
+          },
+        ],
+      }
+
+      const req = makeSignedWebhookRequest(payload)
+      const res = await instagramWebhook.POST(req)
+      assert.strictEqual(res.status, 200)
+
+      const actions = mockStore.webhook_action_ledger.filter((a) => a.action_key.includes(commentId))
+      const hasPublic = actions.some((a) => a.action_type === "public_reply")
+      const hasDm = actions.some((a) => a.action_type === "dm_send")
+      assert.strictEqual(hasPublic, true, "Public reply action should be planned")
+      assert.strictEqual(hasDm, true, "DM action should be planned in both mode")
+    })
+
+    it("WEBHOOK-SM-07: Already-completed action replay skips external API call and marks event complete", async () => {
+      mockStore.automations.push({
+        id: "rule_sm_07",
+        user_id: TEST_USER_ID,
+        name: "Replay Completed Rule",
+        trigger_source: "comment",
+        trigger_type: "keyword",
+        trigger_value: "replay",
+        response_content: JSON.stringify({ message: "Replay response", reply_mode: "public_only" }),
+        is_active: true,
+      })
+
+      const commentId = "comment_sm_07_" + Date.now()
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            changes: [
+              {
+                field: "comments",
+                value: {
+                  id: commentId,
+                  text: "test replay feature",
+                  from: { id: "customer_sm_07" },
+                  media: { id: "media_sm_07" },
+                },
+              },
+            ],
+          },
+        ],
+      }
+
+      // First run: executes normally and marks action completed
+      const req1 = makeSignedWebhookRequest(payload)
+      const res1 = await instagramWebhook.POST(req1)
+      assert.strictEqual(res1.status, 200)
+
+      const actionsBefore = mockStore.webhook_action_ledger.filter((a) => a.action_key.includes(commentId))
+      const publicAction = actionsBefore.find((a) => a.action_type === "public_reply")
+      assert.ok(publicAction, "Public action must exist")
+      assert.strictEqual(publicAction.status, "completed", "Action should be completed after first run")
+
+      // Simulate re-delivery where event is claimed again
+      const event = mockStore.webhook_event_ledger.find((e) => e.event_key === "ig:comment:" + commentId)
+      if (event) {
+        event.status = "claimed"
+        event.lease_token = "new_event_lease_" + Date.now()
+        event.lease_expires_at = new Date(Date.now() + 300000).toISOString()
+      }
+
+      // Second run: replay delivery with action already completed
+      let externalApiCalled = false
+      const origFetch = global.fetch
+      global.fetch = async (url, init) => {
+        if (typeof url === "string" && url.includes("/comments")) {
+          externalApiCalled = true
+        }
+        return origFetch(url, init)
+      }
+
+      try {
+        const req2 = makeSignedWebhookRequest(payload)
+        const res2 = await instagramWebhook.POST(req2)
+        assert.strictEqual(res2.status, 200, "Replay should return 200")
+        assert.strictEqual(externalApiCalled, false, "External API should NOT be called for already-completed action")
+        if (event) {
+          assert.strictEqual(event.status, "completed", "Event should be marked completed after already-completed action replay")
+        }
+      } finally {
+        global.fetch = origFetch
+      }
+    })
+
+    it("WEBHOOK-SM-08: Comment ambiguous outcome (2xx without provider message id) is marked unknown and not retried", async () => {
+      mockStore.automations.push({
+        id: "rule_sm_08",
+        user_id: TEST_USER_ID,
+        name: "Ambiguous Rule",
+        trigger_source: "comment",
+        trigger_type: "keyword",
+        trigger_value: "ambig",
+        response_content: JSON.stringify({ message: "Ambiguous reply", reply_mode: "public_only" }),
+        is_active: true,
+      })
+
+      const commentId = "comment_sm_08_" + Date.now()
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            changes: [
+              {
+                field: "comments",
+                value: {
+                  id: commentId,
+                  text: "ambig please",
+                  from: { id: "customer_sm_08" },
+                  media: { id: "media_sm_08" },
+                },
+              },
+            ],
+          },
+        ],
+      }
+
+      const origFetch = globalThis.fetch
+      globalThis.fetch = async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ success: true }),
+        text: async () => JSON.stringify({ success: true }),
+      })
+
+      try {
+        const res1 = await instagramWebhook.POST(makeSignedWebhookRequest(payload))
+        assert.strictEqual(res1.status, 503, "Ambiguous public reply must not complete the event")
+
+        const publicAction = mockStore.webhook_action_ledger.find(
+          (a) => a.action_key === `public_reply:${commentId}` && a.action_type === "public_reply",
+        )
+        assert.ok(publicAction, "Public reply action must exist")
+        assert.strictEqual(publicAction.status, "unknown", "Ambiguous public reply must be marked unknown")
+
+        // Replay must not retry the ambiguous send
+        const res2 = await instagramWebhook.POST(makeSignedWebhookRequest(payload))
+        assert.strictEqual(res2.status, 503, "Replay of ambiguous outcome must not retry the send")
+      } finally {
+        globalThis.fetch = origFetch
+      }
+    })
+
+    it("WEBHOOK-SM-09: Comment media+text partial success preserves completed media and marks text unknown", async () => {
+      mockStore.automations.push({
+        id: "rule_sm_09",
+        user_id: TEST_USER_ID,
+        name: "Partial Rule",
+        trigger_source: "comment",
+        trigger_type: "keyword",
+        trigger_value: "partial",
+        response_content: JSON.stringify({ message: "Text part", media: { url: "https://example.com/img.jpg", type: "image" }, reply_mode: "both" }),
+        is_active: true,
+      })
+
+      const commentId = "comment_sm_09_" + Date.now()
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            changes: [
+              {
+                field: "comments",
+                value: {
+                  id: commentId,
+                  text: "partial please",
+                  from: { id: "customer_sm_09" },
+                  media: { id: "media_sm_09" },
+                },
+              },
+            ],
+          },
+        ],
+      }
+
+      const origFetch = globalThis.fetch
+      let mediaSent = false
+      globalThis.fetch = async (url, opts) => {
+        const u = String(url)
+        if (u.includes(`${commentId}/replies`)) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ id: "reply_id" }),
+            text: async () => JSON.stringify({ id: "reply_id" }),
+          }
+        }
+        if (u.includes("me/messages")) {
+          if (!mediaSent) {
+            mediaSent = true
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ id: "media_id_123" }),
+              text: async () => JSON.stringify({ id: "media_id_123" }),
+            }
+          }
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ success: true }),
+            text: async () => JSON.stringify({ success: true }),
+          }
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: "profile_id", username: "p" }),
+          text: async () => JSON.stringify({ id: "profile_id" }),
+        }
+      }
+
+      try {
+        const res = await instagramWebhook.POST(makeSignedWebhookRequest(payload))
+        assert.strictEqual(res.status, 503, "Partial success (media ok, text ambiguous) must not complete the event")
+
+        const mediaAction = mockStore.webhook_action_ledger.find(
+          (a) => a.action_key === `dm_send_media:${commentId}` && a.action_type === "dm_send",
+        )
+        const textAction = mockStore.webhook_action_ledger.find(
+          (a) => a.action_key === `dm_send_text:${commentId}` && a.action_type === "dm_send",
+        )
+        assert.ok(mediaAction, "Media action must exist")
+        assert.ok(textAction, "Text action must exist")
+        assert.strictEqual(mediaAction.status, "completed", "Completed media must be preserved")
+        assert.strictEqual(textAction.status, "unknown", "Ambiguous text must be marked unknown, not retried")
+      } finally {
+        globalThis.fetch = origFetch
+      }
+    })
+
+    it("WEBHOOK-SM-10: Story ambiguous outcome is marked unknown and not retried", async () => {
+      mockStore.automations.push({
+        id: "rule_sm_10",
+        user_id: TEST_USER_ID,
+        name: "Story Ambiguous Rule",
+        trigger_source: "story",
+        trigger_type: "reply",
+        trigger_value: "story",
+        response_content: JSON.stringify({ message: "Story reply" }),
+        is_active: true,
+      })
+
+      const storyId = "story_10"
+      const mid = "story_mid_10_" + Date.now()
+      const storyEventKey = `story:reply:${TEST_USER_ID}:${storyId}:${mid}`
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            messaging: [
+              {
+                sender: { id: "customer_sm_10" },
+                recipient: { id: TEST_WEBHOOK_ID },
+                message: { mid: mid, text: "story reply", reply_to: { story: { id: storyId } } },
+              },
+            ],
+          },
+        ],
+      }
+
+      const origFetch = globalThis.fetch
+      globalThis.fetch = async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ success: true }),
+        text: async () => JSON.stringify({ success: true }),
+      })
+
+      try {
+        const res1 = await instagramWebhook.POST(makeSignedWebhookRequest(payload))
+        assert.strictEqual(res1.status, 503, "Ambiguous story reply must not complete the event")
+
+        const textAction = mockStore.webhook_action_ledger.find(
+          (a) => a.action_key === `dm_send:${storyEventKey}` && a.action_type === "dm_send",
+        )
+        assert.ok(textAction, "Story text action must exist")
+        assert.strictEqual(textAction.status, "unknown", "Ambiguous story text must be marked unknown")
+
+        // Replay must not retry the ambiguous send
+        const res2 = await instagramWebhook.POST(makeSignedWebhookRequest(payload))
+        assert.strictEqual(res2.status, 503, "Replay of ambiguous story outcome must not retry the send")
+      } finally {
+        globalThis.fetch = origFetch
+      }
+    })
+
+    it("WEBHOOK-SM-11: AI fallback confirmed success sends exactly once and completes", async () => {
+      const user = mockStore.users[0]
+      user.groq_auto_reply_enabled = true
+      const origGroqApiKey = process.env.GROQ_API_KEY
+      process.env.GROQ_API_KEY = "test_groq_key"
+
+      const origFetch = globalThis.fetch
+      const capturedRequests = []
+      let graphSendCount = 0
+      globalThis.fetch = async (url, opts) => {
+        const u = String(url)
+        if (u.includes("api.groq.com")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ choices: [{ message: { content: "AI reply" } }] }),
+            text: async () => JSON.stringify({ choices: [{ message: { content: "AI reply" } }] }),
+          }
+        }
+        // graph.instagram.com -> confirmed success with provider message id
+        // Only count actual message sends (sendTextDM), not sender actions (mark_seen/typing_on)
+        const bodyStr = opts?.body ? (typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body)) : null
+        if (bodyStr && bodyStr.includes('"message"')) {
+          capturedRequests.push({ url: u, method: opts?.method || "GET", body: bodyStr })
+          graphSendCount++
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: "msg_ai_confirmed_123" }),
+          text: async () => JSON.stringify({ id: "msg_ai_confirmed_123" }),
+        }
+      }
+
+      try {
+        const mid = "ai_mid_11a_" + Date.now()
+        const payload = {
+          object: "instagram",
+          entry: [
+            {
+              id: TEST_WEBHOOK_ID,
+              messaging: [
+                { sender: { id: "customer_sm_11a" }, recipient: { id: TEST_WEBHOOK_ID }, message: { mid, text: "hi ai" } },
+              ],
+            },
+          ],
+        }
+
+        const res1 = await instagramWebhook.POST(makeSignedWebhookRequest(payload))
+        assert.strictEqual(res1.status, 200, "Confirmed AI success must complete with 200")
+
+        // Assert Graph API message send count is exactly 1
+        const graphSends = capturedRequests.filter((r) => r.url.includes("graph.instagram.com"))
+        assert.strictEqual(graphSends.length, 1, "Exactly one Graph API send for confirmed AI success")
+        assert.strictEqual(graphSendCount, 1, "sendTextDM called exactly once")
+
+        const aiDmKey = `dm_send:dm:${TEST_USER_ID}:${mid}`
+        const textAction = mockStore.webhook_action_ledger.find((a) => a.action_key === aiDmKey && a.action_type === "dm_send")
+        assert.ok(textAction, "AI DM text action must exist")
+        assert.strictEqual(textAction.status, "completed", "Confirmed success marks action completed")
+        assert.strictEqual(textAction.provider_message_id, "msg_ai_confirmed_123", "Provider message ID persisted")
+
+        // Event completes after all planned actions resolve
+        const event = mockStore.webhook_event_ledger.find((e) => e.event_key === `dm:${TEST_USER_ID}:${mid}`)
+        assert.ok(event, "Webhook event must exist")
+        assert.strictEqual(event.status, "completed", "Event completes after confirmed AI success")
+      } finally {
+        globalThis.fetch = origFetch
+        if (origGroqApiKey === undefined) {
+          delete process.env.GROQ_API_KEY
+        } else {
+          process.env.GROQ_API_KEY = origGroqApiKey
+        }
+      }
+    })
+
+    it("WEBHOOK-SM-11b: AI fallback ambiguous outcome marks unknown and does not retry on replay", async () => {
+      const user = mockStore.users[0]
+      user.groq_auto_reply_enabled = true
+      const origGroqApiKey = process.env.GROQ_API_KEY
+      process.env.GROQ_API_KEY = "test_groq_key"
+
+      const origFetch = globalThis.fetch
+      const capturedRequests = []
+      globalThis.fetch = async (url, opts) => {
+        const u = String(url)
+        if (u.includes("api.groq.com")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ choices: [{ message: { content: "AI reply" } }] }),
+            text: async () => JSON.stringify({ choices: [{ message: { content: "AI reply" } }] }),
+          }
+        }
+        // graph.instagram.com (mark_seen, typing_on, sendTextDM) -> ambiguous (2xx without message id)
+        // Only count actual message sends (sendTextDM), not sender actions
+        const bodyStr = opts?.body ? (typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body)) : null
+        if (bodyStr && bodyStr.includes('"message"')) {
+          capturedRequests.push({ url: u, method: opts?.method || "GET", body: bodyStr })
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ success: true }),
+          text: async () => JSON.stringify({ success: true }),
+        }
+      }
+
+      try {
+        const mid = "ai_mid_11b_" + Date.now()
+        const payload = {
+          object: "instagram",
+          entry: [
+            {
+              id: TEST_WEBHOOK_ID,
+              messaging: [
+                { sender: { id: "customer_sm_11b" }, recipient: { id: TEST_WEBHOOK_ID }, message: { mid, text: "hi ai" } },
+              ],
+            },
+          ],
+        }
+
+        const res1 = await instagramWebhook.POST(makeSignedWebhookRequest(payload))
+        assert.strictEqual(res1.status, 503, "Ambiguous AI text send must not complete the event")
+
+        // Assert send count = 1 (one Graph API send for the text DM)
+        const graphSends1 = capturedRequests.filter((r) => r.url.includes("graph.instagram.com"))
+        assert.strictEqual(graphSends1.length, 1, "Exactly one Graph API send for ambiguous AI result")
+
+        const aiDmKey = `dm_send:dm:${TEST_USER_ID}:${mid}`
+        const textAction = mockStore.webhook_action_ledger.find((a) => a.action_key === aiDmKey && a.action_type === "dm_send")
+        assert.ok(textAction, "AI DM text action must exist")
+        assert.strictEqual(textAction.status, "unknown", "Ambiguous AI text must be marked unknown")
+        assert.strictEqual(textAction.status !== "processing", true, "Ambiguous action must not be processing")
+        assert.strictEqual(textAction.status !== "retryable", true, "Ambiguous action must not be retryable")
+
+        // Replay the same event — send count must remain 1
+        const sendsBeforeReplay = capturedRequests.filter((r) => r.url.includes("graph.instagram.com")).length
+        const res2 = await instagramWebhook.POST(makeSignedWebhookRequest(payload))
+        assert.strictEqual(res2.status, 503, "Replay of ambiguous AI outcome must not retry the send")
+        const graphSends2 = capturedRequests.filter((r) => r.url.includes("graph.instagram.com"))
+        assert.strictEqual(graphSends2.length, sendsBeforeReplay, "Replay must not add additional Graph API sends")
+      } finally {
+        globalThis.fetch = origFetch
+        if (origGroqApiKey === undefined) {
+          delete process.env.GROQ_API_KEY
+        } else {
+          process.env.GROQ_API_KEY = origGroqApiKey
+        }
+      }
+    })
+
+    it("WEBHOOK-SM-11c: AI fallback replay of completed event sends zero additional messages", async () => {
+      const user = mockStore.users[0]
+      user.groq_auto_reply_enabled = true
+      const origGroqApiKey = process.env.GROQ_API_KEY
+      process.env.GROQ_API_KEY = "test_groq_key"
+
+      const origFetch = globalThis.fetch
+      const capturedRequests = []
+      globalThis.fetch = async (url, opts) => {
+        const u = String(url)
+        if (u.includes("api.groq.com")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ choices: [{ message: { content: "AI reply" } }] }),
+            text: async () => JSON.stringify({ choices: [{ message: { content: "AI reply" } }] }),
+          }
+        }
+        // graph.instagram.com -> confirmed success with provider message id
+        // Only count actual message sends (sendTextDM), not sender actions
+        const bodyStr = opts?.body ? (typeof opts.body === "string" ? opts.body : JSON.stringify(opts.body)) : null
+        if (bodyStr && bodyStr.includes('"message"')) {
+          capturedRequests.push({ url: u, method: opts?.method || "GET", body: bodyStr })
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: "msg_ai_completed_456" }),
+          text: async () => JSON.stringify({ id: "msg_ai_completed_456" }),
+        }
+      }
+
+      try {
+        const mid = "ai_mid_11c_" + Date.now()
+        const payload = {
+          object: "instagram",
+          entry: [
+            {
+              id: TEST_WEBHOOK_ID,
+              messaging: [
+                { sender: { id: "customer_sm_11c" }, recipient: { id: TEST_WEBHOOK_ID }, message: { mid, text: "hi ai" } },
+              ],
+            },
+          ],
+        }
+
+        // First request: completes the AI event
+        const res1 = await instagramWebhook.POST(makeSignedWebhookRequest(payload))
+        assert.strictEqual(res1.status, 200, "First AI request must complete")
+        const sendsAfterFirst = capturedRequests.filter((r) => r.url.includes("graph.instagram.com")).length
+        assert.strictEqual(sendsAfterFirst, 1, "Exactly one Graph API send on first request")
+
+        const aiDmKey = `dm_send:dm:${TEST_USER_ID}:${mid}`
+        const textAction = mockStore.webhook_action_ledger.find((a) => a.action_key === aiDmKey && a.action_type === "dm_send")
+        assert.ok(textAction, "AI DM text action must exist")
+        assert.strictEqual(textAction.status, "completed", "Action must be completed")
+
+        // Second request: replay of completed event — zero additional sends
+        const res2 = await instagramWebhook.POST(makeSignedWebhookRequest(payload))
+        assert.strictEqual(res2.status, 200, "Replay of completed AI event must return 200")
+        const sendsAfterReplay = capturedRequests.filter((r) => r.url.includes("graph.instagram.com")).length
+        assert.strictEqual(sendsAfterReplay, sendsAfterFirst, "Replay of completed event must send zero additional messages")
+      } finally {
+        globalThis.fetch = origFetch
+        if (origGroqApiKey === undefined) {
+          delete process.env.GROQ_API_KEY
+        } else {
+          process.env.GROQ_API_KEY = origGroqApiKey
+        }
+      }
+    })
+
+    it("WEBHOOK-SM-12: Comment media 429 is retryable; text stays pending until media succeeds", async () => {
+      mockStore.automations.push({
+        id: "rule_sm_12",
+        user_id: TEST_USER_ID,
+        name: "Media Retry Rule",
+        trigger_source: "comment",
+        trigger_type: "keyword",
+        trigger_value: "media",
+        response_content: JSON.stringify({ message: "Here is your media", media: { url: "https://example.com/img.jpg", type: "image" }, reply_mode: "both" }),
+        is_active: true,
+      })
+
+      const commentId = "comment_sm_12_" + Date.now()
+      const payload = {
+        object: "instagram",
+        entry: [
+          {
+            id: TEST_WEBHOOK_ID,
+            changes: [
+              {
+                field: "comments",
+                value: {
+                  id: commentId,
+                  text: "send me media",
+                  from: { id: "customer_sm_12" },
+                  media: { id: "media_sm_12" },
+                },
+              },
+            ],
+          },
+        ],
+      }
+
+      let mediaCalls = 0
+      let textCalls = 0
+      const origFetch = globalThis.fetch
+      globalThis.fetch = async (url, opts) => {
+        const u = String(url)
+        if (u.includes(`${commentId}/replies`)) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ id: "reply_id" }),
+            text: async () => JSON.stringify({ id: "reply_id" }),
+          }
+        }
+        if (u.includes("/me/messages")) {
+          let body = {}
+          try { body = opts && opts.body ? JSON.parse(opts.body) : {} } catch { body = {} }
+          if (body.message && body.message.attachment) {
+            mediaCalls++
+            if (mediaCalls === 1) {
+              return {
+                ok: false,
+                status: 429,
+                json: async () => ({ error: { message: "rate limited" } }),
+                text: async () => JSON.stringify({ error: { message: "rate limited" } }),
+              }
+            }
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ id: "media_id_123" }),
+              text: async () => JSON.stringify({ id: "media_id_123" }),
+            }
+          }
+          if (body.message && body.message.text) {
+            textCalls++
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ id: "text_id_123" }),
+              text: async () => JSON.stringify({ id: "text_id_123" }),
+            }
+          }
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ id: "profile_id", username: "p" }),
+          text: async () => JSON.stringify({ id: "profile_id" }),
+        }
+      }
+
+      try {
+        // 1. First media attempt returns 429 -> event must not complete
+        const res1 = await instagramWebhook.POST(makeSignedWebhookRequest(payload))
+        assert.strictEqual(res1.status, 503, "Retryable media 429 must not complete the event")
+
+        // 2. Media is retryable and text is not completed
+        const mediaAction1 = mockStore.webhook_action_ledger.find((a) => a.action_key === `dm_send_media:${commentId}` && a.action_type === "dm_send")
+        const textAction1 = mockStore.webhook_action_ledger.find((a) => a.action_key === `dm_send_text:${commentId}` && a.action_type === "dm_send")
+        assert.ok(mediaAction1, "Media action must exist")
+        assert.strictEqual(mediaAction1.status, "retryable", "Media 429 must be marked retryable")
+        assert.ok(textAction1, "Text action must be registered")
+        assert.strictEqual(textAction1.status !== "completed", true, "Text must not be completed when media is retryable")
+
+        // 3 & 4. Replay event: media retries and succeeds
+        const res2 = await instagramWebhook.POST(makeSignedWebhookRequest(payload))
+        assert.strictEqual(res2.status, 200, "Replay with successful media must complete the event")
+
+        // 5. Text is sent and completed
+        const textAction2 = mockStore.webhook_action_ledger.find((a) => a.action_key === `dm_send_text:${commentId}` && a.action_type === "dm_send")
+        assert.ok(textAction2, "Text action must exist after media retry")
+        assert.strictEqual(textAction2.status, "completed", "Text must be completed after successful media retry")
+
+        // 6. media count = 2, text count = 1
+        assert.strictEqual(mediaCalls, 2, "Media provider must be called exactly twice")
+        assert.strictEqual(textCalls, 1, "Text provider must be called exactly once")
+
+        // 7. Another replay sends neither again
+        const res3 = await instagramWebhook.POST(makeSignedWebhookRequest(payload))
+        assert.strictEqual(res3.status, 200, "Third replay must complete with no sends")
+        assert.strictEqual(mediaCalls, 2, "Media provider must not be called on third replay")
+        assert.strictEqual(textCalls, 1, "Text provider must not be called on third replay")
+      } finally {
+        globalThis.fetch = origFetch
+      }
+    })
+  })
+})
+
+describe("[UNIT] Instagram API provider outcomes (lib/instagram-api.ts)", () => {
+  let originalFetch
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch
+  })
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  it("INSTAGRAM-API-01: 200 with valid provider message id -> confirmed_success", async () => {
+    globalThis.fetch = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ id: "msg_123" }),
+      text: async () => JSON.stringify({ id: "msg_123" }),
+    })
+    const outcome = await sendTextDM("token", { id: "recipient" }, "hi")
+    assert.strictEqual(outcome.kind, "confirmed_success")
+    assert.strictEqual(outcome.message_id, "msg_123")
+  })
+
+  it("INSTAGRAM-API-02: 200 without provider message id -> ambiguous, not accepted as success", async () => {
+    globalThis.fetch = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ success: true }),
+      text: async () => JSON.stringify({ success: true }),
+    })
+    const outcome = await sendTextDM("token", { id: "recipient" }, "hi")
+    assert.strictEqual(outcome.kind, "ambiguous")
+  })
+
+  it("INSTAGRAM-API-03: 200 with malformed JSON -> ambiguous", async () => {
+    globalThis.fetch = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => {
+        throw new Error("bad json")
+      },
+      text: async () => "not json",
+    })
+    const outcome = await sendTextDM("token", { id: "recipient" }, "hi")
+    assert.strictEqual(outcome.kind, "ambiguous")
+  })
+
+  it("INSTAGRAM-API-04: 200 with an error body -> ambiguous", async () => {
+    globalThis.fetch = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ error: { message: "boom" } }),
+      text: async () => JSON.stringify({ error: { message: "boom" } }),
+    })
+    const outcome = await sendTextDM("token", { id: "recipient" }, "hi")
+    assert.strictEqual(outcome.kind, "ambiguous")
+  })
+
+  it("INSTAGRAM-API-05: 429 -> confirmed_rejection", async () => {
+    globalThis.fetch = async () => ({
+      ok: false,
+      status: 429,
+      json: async () => ({ error: { message: "rate limited" } }),
+      text: async () => JSON.stringify({ error: { message: "rate limited" } }),
+    })
+    const outcome = await sendTextDM("token", { id: "recipient" }, "hi")
+    assert.strictEqual(outcome.kind, "confirmed_rejection")
+    assert.strictEqual(outcome.status, 429)
+  })
+
+  it("INSTAGRAM-API-06: 5xx -> ambiguous, never retryable", async () => {
+    globalThis.fetch = async () => ({
+      ok: false,
+      status: 500,
+      json: async () => ({ error: { message: "server error" } }),
+      text: async () => JSON.stringify({ error: { message: "server error" } }),
+    })
+    const outcome = await sendTextDM("token", { id: "recipient" }, "hi")
+    assert.strictEqual(outcome.kind, "ambiguous")
+  })
+
+  it("INSTAGRAM-API-07: Transport failure -> ambiguous, never retryable", async () => {
+    globalThis.fetch = async () => {
+      throw new TypeError("fetch failed")
+    }
+    const outcome = await sendTextDM("token", { id: "recipient" }, "hi")
+    assert.strictEqual(outcome.kind, "ambiguous")
   })
 })

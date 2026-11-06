@@ -40,29 +40,100 @@ export interface QuickReply {
   payload: string
 }
 
+/**
+ * Typed provider outcome for every outgoing Meta Graph API call.
+ *
+ * - confirmed_success: Meta confirmed acceptance; safe to mark the action completed.
+ * - confirmed_rejection: the response reliably establishes the message was NOT
+ *   accepted (e.g. 4xx). Safe to mark retryable (429) or permanently_failed.
+ * - ambiguous: a timeout, connection reset, lost response, uncertain 5xx, or
+ *   malformed response after the request may have reached Meta. Never mark
+ *   retryable — mark unknown and require review.
+ */
+export type SendOutcome =
+  | { kind: "confirmed_success"; message_id: string }
+  | { kind: "confirmed_rejection"; status: number; error?: any }
+  | {
+      kind: "ambiguous"
+      reason: "timeout" | "network_error" | "uncertain_server" | "malformed_response"
+      status?: number
+      error?: any
+    }
+
 export interface SendResult {
   ok: boolean
   id?: string
   error?: any
 }
 
-async function post(path: string, token: string, body: any): Promise<SendResult> {
+function outcomeToSendResult(outcome: SendOutcome): SendResult {
+  if (outcome.kind === "confirmed_success") {
+    return { ok: true, id: outcome.message_id }
+  }
+  return { ok: false, error: outcome.error }
+}
+
+async function post(path: string, token: string, body: any): Promise<SendOutcome> {
+  let res: Response
   try {
-    const res = await fetch(`${GRAPH}/${path}?access_token=${encodeURIComponent(token)}`, {
+    res = await fetch(`${GRAPH}/${path}?access_token=${encodeURIComponent(token)}`, {
       method: "POST",
       signal: AbortSignal.timeout(15000),
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     })
-    const json = await res.json()
-    if (!res.ok || json.error) {
-      console.error(`[ig-api] Request failed: status=${sanitizeHttpStatus(res.status)}`)
-      return { ok: false, error: json.error || `HTTP ${res.status}` }
-    }
-    return { ok: true, id: json.id || json.message_id }
   } catch (e) {
-    console.error(`[ig-api] Request error: category=${sanitizeErrorCategory(e)}`)
-    return { ok: false, error: e }
+    // The request never reached Meta (timeout / DNS / connection reset).
+    // Acceptance cannot be ruled out → ambiguous, never retryable.
+    const category = sanitizeErrorCategory(e)
+    return {
+      kind: "ambiguous",
+      reason: category === "timeout" ? "timeout" : "network_error",
+      error: e,
+    }
+  }
+
+  const status = res.status
+  let json: Record<string, unknown> | null = null
+  let parseError: unknown = null
+  try {
+    json = (await res.json()) as Record<string, unknown> | null
+  } catch (e) {
+    parseError = e
+  }
+
+  const hasJsonError = Boolean(json && json.error)
+
+  // Confirmed acceptance: 2xx, no error in the body, AND a valid provider
+  // message id. A 2xx without a provider message id is not a confirmed
+  // message delivery — never manufacture an id (e.g. String(status)) to fake
+  // success. Treat it as ambiguous so the action is marked unknown and never
+  // auto-resent.
+  if (res.ok && !hasJsonError) {
+    const messageId = (json?.id || json?.message_id) as string | undefined
+    if (messageId) {
+      return { kind: "confirmed_success", message_id: messageId }
+    }
+    return {
+      kind: "ambiguous",
+      reason: "uncertain_server",
+      status,
+      error: "no_provider_message_id",
+    }
+  }
+
+  // 4xx = definitive non-acceptance (confirmed rejection).
+  if (status >= 400 && status < 500) {
+    return { kind: "confirmed_rejection", status, error: hasJsonError ? json?.error : `HTTP ${status}` }
+  }
+
+  // 5xx or conflicting 2xx-with-error = ambiguous; Meta may have accepted
+  // before the response was lost. Never retry automatically.
+  return {
+    kind: "ambiguous",
+    reason: "uncertain_server",
+    status,
+    error: hasJsonError ? json?.error : parseError,
   }
 }
 
@@ -86,12 +157,6 @@ export function buildCardAttachment(card: IGCard) {
   }
 }
 
-/**
- * Build the follower-gate card shown to non-followers. Centralized so the
- * comment, story, and DM branches all share the same copy and the same
- * `as const` button types — preserving the `"web_url"` / `"postback"`
- * literal types that `IGButton` requires.
- */
 export function buildFollowGateCard(params: {
   username: string
   ruleId: string
@@ -113,7 +178,7 @@ export async function sendTextDM(
   recipient: { id?: string; comment_id?: string },
   text: string,
   quickReplies?: QuickReply[],
-): Promise<SendResult> {
+): Promise<SendOutcome> {
   const message: any = { text }
   if (quickReplies?.length) {
     message.quick_replies = quickReplies.slice(0, 13).map((q) => ({
@@ -122,15 +187,15 @@ export async function sendTextDM(
       payload: q.payload,
     }))
   }
-  return post("me/messages", token, { recipient, message })
+  return await post("me/messages", token, { recipient, message })
 }
 
 export async function sendCardDM(
   token: string,
   recipient: { id?: string; comment_id?: string },
   card: IGCard,
-): Promise<SendResult> {
-  return post("me/messages", token, { recipient, message: buildCardAttachment(card) })
+): Promise<SendOutcome> {
+  return await post("me/messages", token, { recipient, message: buildCardAttachment(card) })
 }
 
 export async function sendMediaDM(
@@ -138,8 +203,8 @@ export async function sendMediaDM(
   recipient: { id?: string; comment_id?: string },
   mediaType: "image" | "video" | "audio",
   url: string,
-): Promise<SendResult> {
-  return post("me/messages", token, {
+): Promise<SendOutcome> {
+  return await post("me/messages", token, {
     recipient,
     message: { attachment: { type: mediaType, payload: { url } } },
   })
@@ -149,8 +214,8 @@ export async function sendSenderAction(
   token: string,
   recipientId: string,
   action: "typing_on" | "typing_off" | "mark_seen",
-): Promise<SendResult> {
-  return post("me/messages", token, { recipient: { id: recipientId }, sender_action: action })
+): Promise<SendOutcome> {
+  return await post("me/messages", token, { recipient: { id: recipientId }, sender_action: action })
 }
 
 export async function sendMessageReaction(
@@ -158,16 +223,16 @@ export async function sendMessageReaction(
   recipientId: string,
   messageId: string,
   reaction = "love",
-): Promise<SendResult> {
-  return post("me/messages", token, {
+): Promise<SendOutcome> {
+  return await post("me/messages", token, {
     recipient: { id: recipientId },
     sender_action: "react",
     payload: { message_id: messageId, reaction },
   })
 }
 
-export async function replyToComment(token: string, commentId: string, message: string): Promise<SendResult> {
-  return post(`${commentId}/replies`, token, { message })
+export async function replyToComment(token: string, commentId: string, message: string): Promise<SendOutcome> {
+  return await post(`${commentId}/replies`, token, { message })
 }
 
 export async function fetchProfile(token: string, igUserId: string): Promise<{ username?: string; name?: string } | null> {
@@ -193,3 +258,5 @@ export async function verifyIdOwnership(token: string, id: string): Promise<bool
 export function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, Math.min(ms, 8000)))
 }
+
+export { sanitizeHttpStatus, sanitizeErrorCategory, outcomeToSendResult }

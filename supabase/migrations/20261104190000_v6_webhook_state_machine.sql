@@ -123,6 +123,16 @@ ALTER TABLE public.webhook_action_ledger ENABLE ROW LEVEL SECURITY;
 -- RPC: fn_webhook_claim_event
 -- Claim or reclaim an event ledger row. Attempt count increments only on
 -- successful lease acquisition. Enforces retry_at and max_attempts.
+--
+-- Locking/clock discipline (Corrections B & D):
+-- 1. Attempt insertion with the idempotency key.
+-- 2. On conflict, lock the existing row with SELECT ... FOR UPDATE.
+-- 3. Refresh clock_timestamp() AFTER acquiring the row lock.
+-- 4. Re-evaluate status, retry eligibility, expiry, terminal and manual-review
+--    state against the fresh clock.
+-- 5. An unknown external side-effect child action blocks reclaim (manual_review).
+-- 6. The reclaim UPDATE is guarded by expected-state predicates.
+-- 7. attempt_count increments only when a genuine new lease is acquired (F).
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.fn_webhook_claim_event(
   p_event_key TEXT,
@@ -143,6 +153,7 @@ DECLARE
   v_new_token UUID := gen_random_uuid();
   v_row public.webhook_event_ledger%ROWTYPE;
   v_now TIMESTAMPTZ := clock_timestamp();
+  v_unknown_side_effect_child INTEGER := 0;
 BEGIN
   IF p_lease_ttl_seconds <= 0 OR p_lease_ttl_seconds > 86400 THEN
     outcome := 'invalid_ttl';
@@ -178,7 +189,7 @@ BEGIN
     v_now, v_now
   )
   ON CONFLICT (event_key) DO NOTHING
-  RETURNING id, lease_token, lease_expires_at, user_id, event_type
+  RETURNING id, webhook_event_ledger.lease_token, webhook_event_ledger.lease_expires_at, user_id, event_type
   INTO v_row.id, v_row.lease_token, v_row.lease_expires_at, v_row.user_id, v_row.event_type;
 
   IF FOUND THEN
@@ -189,10 +200,16 @@ BEGIN
     RETURN;
   END IF;
 
+  -- Lock the existing row before re-evaluating its state (B: row serialization).
   SELECT *
   INTO v_row
   FROM public.webhook_event_ledger
-  WHERE event_key = p_event_key;
+  WHERE event_key = p_event_key
+  FOR UPDATE;
+
+  -- Refresh clock after acquiring the row lock (D: never validate against a
+  -- time value captured before a lock wait).
+  v_now := clock_timestamp();
 
   IF v_row.user_id <> p_user_id OR v_row.event_type <> p_event_type THEN
     outcome := 'identity_mismatch';
@@ -226,16 +243,44 @@ BEGIN
     RETURN;
   END IF;
 
-  IF v_row.status = 'released' AND v_row.retry_at IS NOT NULL AND v_row.retry_at > v_now THEN
-    outcome := 'retry_not_due';
+  IF v_row.status = 'released' THEN
+    IF v_row.retry_at IS NOT NULL AND v_row.retry_at > v_now THEN
+      outcome := 'retry_not_due';
+      event_id := v_row.id;
+      lease_token := NULL;
+      lease_expires_at := NULL;
+      RETURN;
+    END IF;
+  END IF;
+
+  IF v_row.status = 'claimed' AND v_row.lease_expires_at IS NOT NULL AND v_row.lease_expires_at > v_now THEN
+    outcome := 'active_lease';
     event_id := v_row.id;
     lease_token := NULL;
     lease_expires_at := NULL;
     RETURN;
   END IF;
 
-  IF v_row.status = 'claimed' AND v_row.lease_expires_at > v_now THEN
-    outcome := 'active_lease';
+  -- B #5: an unknown external side-effect child action blocks reclaim. The
+  -- event must be resolved through manual review before it can be reclaimed.
+  SELECT COUNT(*)
+  INTO v_unknown_side_effect_child
+  FROM public.webhook_action_ledger
+  WHERE webhook_action_ledger.event_id = v_row.id
+    AND side_effect = TRUE
+    AND status = 'unknown';
+
+  IF v_unknown_side_effect_child > 0 THEN
+    UPDATE public.webhook_event_ledger
+    SET status = 'manual_review',
+        lease_token = NULL,
+        lease_expires_at = NULL,
+        error_category = 'unknown',
+        error_code = 'unknown_side_effect',
+        updated_at = v_now
+    WHERE id = v_row.id
+      AND status <> 'manual_review';
+    outcome := 'manual_review';
     event_id := v_row.id;
     lease_token := NULL;
     lease_expires_at := NULL;
@@ -244,7 +289,10 @@ BEGIN
 
   IF v_row.attempt_count >= v_row.max_attempts THEN
     UPDATE public.webhook_event_ledger
-    SET status = 'dead_letter', lease_token = NULL, lease_expires_at = NULL, updated_at = v_now
+    SET status = 'dead_letter',
+        lease_token = NULL,
+        lease_expires_at = NULL,
+        updated_at = v_now
     WHERE id = v_row.id AND status <> 'dead_letter';
     outcome := 'dead_letter';
     event_id := v_row.id;
@@ -253,6 +301,8 @@ BEGIN
     RETURN;
   END IF;
 
+  -- F #8: a genuine new lease acquisition increments attempt_count exactly
+  -- once. Guarded by expected-state predicates so a concurrent holder wins.
   UPDATE public.webhook_event_ledger
   SET status = 'claimed',
       attempt_count = v_row.attempt_count + 1,
@@ -260,7 +310,11 @@ BEGIN
       lease_expires_at = v_now + (p_lease_ttl_seconds || ' seconds')::interval,
       updated_at = v_now
   WHERE id = v_row.id
-  RETURNING id, lease_token, lease_expires_at
+    AND status IN ('released', 'claimed')
+    AND (webhook_event_ledger.lease_token IS NULL
+         OR webhook_event_ledger.lease_expires_at IS NULL
+         OR webhook_event_ledger.lease_expires_at <= v_now)
+  RETURNING id, webhook_event_ledger.lease_token, webhook_event_ledger.lease_expires_at
   INTO v_row.id, v_row.lease_token, v_row.lease_expires_at;
 
   IF NOT FOUND THEN
@@ -311,7 +365,7 @@ DECLARE
   v_arr_len INTEGER;
   v_i INTEGER;
   v_existing_actions INTEGER;
-  v_now TIMESTAMPTZ := clock_timestamp();
+  v_now TIMESTAMPTZ;
 BEGIN
   IF p_actions IS NULL OR jsonb_typeof(p_actions) <> 'array' THEN
     outcome := 'invalid_actions_spec';
@@ -325,6 +379,11 @@ BEGIN
   FROM public.webhook_event_ledger
   WHERE id = p_event_id
   FOR UPDATE;
+
+  -- Refresh the clock immediately after acquiring the parent event lock, and
+  -- before any lease-expiry validation, so a clock read taken while waiting
+  -- for the lock cannot let an expired lease slip through.
+  v_now := clock_timestamp();
 
   IF NOT FOUND THEN
     outcome := 'event_not_found';
@@ -508,7 +567,17 @@ $$;
 -- RPC: fn_webhook_claim_action
 -- Claim an action: pending or eligible retryable -> processing.
 -- Expired external side-effect actions become unknown (never blindly resent).
--- Parent-first fencing: lock event, verify event lease, lock action, verify action.
+-- Parent-first lock: event row first, then action row.
+--
+-- Locking/clock discipline (Corrections C & D):
+-- 1. Lock parent event.
+-- 2. Validate parent token/status.
+-- 3. Lock child action.
+-- 4. Obtain fresh clock_timestamp() after both locks are held.
+-- 5. Revalidate parent lease expiry AFTER child lock acquisition; a parent
+--    lease that expired while waiting for the child lock is rejected.
+-- 6. Validate child action status/token/expiry against the fresh clock.
+-- 7. Apply the action claim transition (attempt_count increments only here).
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.fn_webhook_claim_action(
   p_event_id UUID,
@@ -537,6 +606,7 @@ BEGIN
     RETURN;
   END IF;
 
+  -- 1. Lock parent event row FIRST.
   SELECT *
   INTO v_event
   FROM public.webhook_event_ledger
@@ -567,14 +637,6 @@ BEGIN
     RETURN;
   END IF;
 
-  IF v_event.lease_expires_at IS NOT NULL AND v_event.lease_expires_at <= v_now THEN
-    outcome := 'event_lease_expired';
-    action_id := NULL;
-    lease_token := NULL;
-    lease_expires_at := NULL;
-    RETURN;
-  END IF;
-
   IF NOT v_event.action_plan_sealed THEN
     outcome := 'plan_not_sealed';
     action_id := NULL;
@@ -583,6 +645,7 @@ BEGIN
     RETURN;
   END IF;
 
+  -- 3. Lock child action row SECOND.
   SELECT *
   INTO v_row
   FROM public.webhook_action_ledger
@@ -597,6 +660,20 @@ BEGIN
     RETURN;
   END IF;
 
+  -- 4. Fresh clock after both locks are held.
+  v_now := clock_timestamp();
+
+  -- 5. Revalidate parent lease expiry AFTER child lock acquisition. A parent
+  --    lease that expired while waiting for the child lock must be rejected.
+  IF v_event.lease_expires_at IS NOT NULL AND v_event.lease_expires_at <= v_now THEN
+    outcome := 'event_lease_expired';
+    action_id := NULL;
+    lease_token := NULL;
+    lease_expires_at := NULL;
+    RETURN;
+  END IF;
+
+  -- 6. Validate child action status/token/expiry against the fresh clock.
   IF v_row.status IN ('unknown', 'permanently_failed') THEN
     outcome := 'action_terminal';
     action_id := v_row.id;
@@ -667,6 +744,8 @@ BEGIN
     RETURN;
   END IF;
 
+  -- 7. Apply the action claim transition. attempt_count increments only on a
+  --    genuine new action-lease acquisition (F).
   UPDATE public.webhook_action_ledger AS a
   SET status = 'processing',
       attempt_count = v_row.attempt_count + 1,
@@ -674,7 +753,9 @@ BEGIN
       lease_expires_at = v_now + (p_lease_ttl_seconds || ' seconds')::interval,
       updated_at = v_now
   WHERE id = v_row.id
-  RETURNING id, lease_token, lease_expires_at
+    AND status IN ('pending', 'retryable', 'processing')
+    AND (a.lease_token IS NULL OR a.lease_expires_at IS NULL OR a.lease_expires_at <= v_now)
+  RETURNING id, a.lease_token, a.lease_expires_at
   INTO v_row.id, v_row.lease_token, v_row.lease_expires_at;
 
   IF NOT FOUND THEN
@@ -711,30 +792,66 @@ LANGUAGE plpgsql
 SET search_path = 'public, pg_temp'
 AS $$
 DECLARE
+  v_event_id UUID;
   v_event_lease UUID;
   v_event_status TEXT;
   v_event_lease_expires TIMESTAMPTZ;
-  v_now TIMESTAMPTZ := clock_timestamp();
+  v_action_lease_expires TIMESTAMPTZ;
+  v_now TIMESTAMPTZ;
 BEGIN
-  SELECT el.lease_token, el.status, el.lease_expires_at
+  -- Read parent event reference from action
+  SELECT event_id INTO v_event_id
+  FROM public.webhook_action_ledger
+  WHERE id = p_action_id;
+
+  IF NOT FOUND OR v_event_id IS NULL THEN
+    result := FALSE;
+    RETURN;
+  END IF;
+
+  -- 1. Lock parent event row FIRST
+  SELECT lease_token, status, lease_expires_at
   INTO v_event_lease, v_event_status, v_event_lease_expires
-  FROM public.webhook_action_ledger al
-  JOIN public.webhook_event_ledger el ON el.id = al.event_id
-  WHERE al.id = p_action_id
-  FOR UPDATE OF el;
+  FROM public.webhook_event_ledger
+  WHERE id = v_event_id
+  FOR UPDATE;
 
   IF NOT FOUND THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
 
   IF v_event_status <> 'claimed' THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
   IF v_event_lease IS DISTINCT FROM p_event_lease_token THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
+
+  -- 2. Lock child action row SECOND
+  SELECT lease_expires_at
+  INTO v_action_lease_expires
+  FROM public.webhook_action_ledger
+  WHERE id = p_action_id AND event_id = v_event_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    result := FALSE;
+    RETURN;
+  END IF;
+
+  -- 3. Refresh clock timestamp after acquiring row locks
+  v_now := clock_timestamp();
+
   IF v_event_lease_expires IS NOT NULL AND v_event_lease_expires <= v_now THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
+  END IF;
+  IF v_action_lease_expires IS NOT NULL AND v_action_lease_expires <= v_now THEN
+    result := FALSE;
+    RETURN;
   END IF;
 
   UPDATE public.webhook_action_ledger
@@ -750,7 +867,8 @@ BEGIN
     AND lease_token = p_action_lease_token
     AND status = 'processing';
 
-  RETURN FOUND;
+  result := FOUND;
+  RETURN;
 END;
 $$;
 
@@ -773,37 +891,74 @@ LANGUAGE plpgsql
 SET search_path = 'public, pg_temp'
 AS $$
 DECLARE
+  v_event_id UUID;
   v_event_lease UUID;
   v_event_status TEXT;
   v_event_lease_expires TIMESTAMPTZ;
   v_attempt_count INTEGER;
   v_max_attempts INTEGER;
   v_next_retry TIMESTAMPTZ;
-  v_now TIMESTAMPTZ := clock_timestamp();
+  v_action_lease_expires TIMESTAMPTZ;
+  v_now TIMESTAMPTZ;
 BEGIN
-  SELECT el.lease_token, el.status, el.lease_expires_at, al.attempt_count, al.max_attempts
-  INTO v_event_lease, v_event_status, v_event_lease_expires, v_attempt_count, v_max_attempts
-  FROM public.webhook_action_ledger al
-  JOIN public.webhook_event_ledger el ON el.id = al.event_id
-  WHERE al.id = p_action_id
-  FOR UPDATE OF el;
+  -- Read parent event reference from action
+  SELECT event_id INTO v_event_id
+  FROM public.webhook_action_ledger
+  WHERE id = p_action_id;
+
+  IF NOT FOUND OR v_event_id IS NULL THEN
+    result := FALSE;
+    RETURN;
+  END IF;
+
+  -- 1. Lock parent event row FIRST
+  SELECT lease_token, status, lease_expires_at
+  INTO v_event_lease, v_event_status, v_event_lease_expires
+  FROM public.webhook_event_ledger
+  WHERE id = v_event_id
+  FOR UPDATE;
 
   IF NOT FOUND THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
 
   IF v_event_status <> 'claimed' THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
   IF v_event_lease IS DISTINCT FROM p_event_lease_token THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
-  IF v_event_lease_expires IS NOT NULL AND v_event.lease_expires_at <= v_now THEN
-    RETURN FALSE;
+
+  -- 2. Lock child action row SECOND
+  SELECT attempt_count, max_attempts, lease_expires_at
+  INTO v_attempt_count, v_max_attempts, v_action_lease_expires
+  FROM public.webhook_action_ledger
+  WHERE id = p_action_id AND event_id = v_event_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    result := FALSE;
+    RETURN;
+  END IF;
+
+  -- 3. Refresh clock timestamp after acquiring row locks
+  v_now := clock_timestamp();
+
+  IF v_event_lease_expires IS NOT NULL AND v_event_lease_expires <= v_now THEN
+    result := FALSE;
+    RETURN;
+  END IF;
+  IF v_action_lease_expires IS NOT NULL AND v_action_lease_expires <= v_now THEN
+    result := FALSE;
+    RETURN;
   END IF;
 
   IF p_backoff_base_seconds <= 0 OR p_backoff_cap_seconds <= 0 OR p_backoff_cap_seconds < p_backoff_base_seconds THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
 
   IF v_attempt_count >= v_max_attempts THEN
@@ -812,7 +967,8 @@ BEGIN
         error_category = p_error_category, error_code = p_error_code,
         updated_at = v_now
     WHERE id = p_action_id AND lease_token = p_action_lease_token AND status = 'processing';
-    RETURN FOUND;
+    result := FOUND;
+    RETURN;
   END IF;
 
   v_next_retry := v_now +
@@ -824,7 +980,8 @@ BEGIN
       retry_at = v_next_retry, updated_at = v_now
   WHERE id = p_action_id AND lease_token = p_action_lease_token AND status = 'processing';
 
-  RETURN FOUND;
+  result := FOUND;
+  RETURN;
 END;
 $$;
 
@@ -844,29 +1001,64 @@ LANGUAGE plpgsql
 SET search_path = 'public, pg_temp'
 AS $$
 DECLARE
+  v_event_id UUID;
   v_event_lease UUID;
   v_event_status TEXT;
   v_event_lease_expires TIMESTAMPTZ;
-  v_now TIMESTAMPTZ := clock_timestamp();
+  v_action_lease_expires TIMESTAMPTZ;
+  v_now TIMESTAMPTZ;
 BEGIN
-  SELECT el.lease_token, el.status, el.lease_expires_at
+  -- Read parent event reference from action
+  SELECT event_id INTO v_event_id
+  FROM public.webhook_action_ledger
+  WHERE id = p_action_id;
+
+  IF NOT FOUND OR v_event_id IS NULL THEN
+    result := FALSE;
+    RETURN;
+  END IF;
+
+  -- 1. Lock parent event row FIRST
+  SELECT lease_token, status, lease_expires_at
   INTO v_event_lease, v_event_status, v_event_lease_expires
-  FROM public.webhook_action_ledger al
-  JOIN public.webhook_event_ledger el ON el.id = al.event_id
-  WHERE al.id = p_action_id
-  FOR UPDATE OF el;
+  FROM public.webhook_event_ledger
+  WHERE id = v_event_id
+  FOR UPDATE;
 
   IF NOT FOUND THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
 
   IF v_event_status <> 'claimed' THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
   IF v_event_lease IS DISTINCT FROM p_event_lease_token THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
+
+  -- 2. Lock child action row SECOND
+  SELECT lease_expires_at
+  INTO v_action_lease_expires
+  FROM public.webhook_action_ledger
+  WHERE id = p_action_id AND event_id = v_event_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    result := FALSE;
+    RETURN;
+  END IF;
+
+  -- 3. Refresh clock timestamp after acquiring row locks
+  v_now := clock_timestamp();
+
   IF v_event_lease_expires IS NOT NULL AND v_event_lease_expires <= v_now THEN
+    result := FALSE;
+    RETURN;
+  END IF;
+  IF v_action_lease_expires IS NOT NULL AND v_action_lease_expires <= v_now THEN
     result := FALSE;
     RETURN;
   END IF;
@@ -878,7 +1070,8 @@ BEGIN
     AND lease_token = p_action_lease_token
     AND status = 'processing';
 
-  RETURN FOUND;
+  result := FOUND;
+  RETURN;
 END;
 $$;
 
@@ -898,30 +1091,66 @@ LANGUAGE plpgsql
 SET search_path = 'public, pg_temp'
 AS $$
 DECLARE
+  v_event_id UUID;
   v_event_lease UUID;
   v_event_status TEXT;
   v_event_lease_expires TIMESTAMPTZ;
-  v_now TIMESTAMPTZ := clock_timestamp();
+  v_action_lease_expires TIMESTAMPTZ;
+  v_now TIMESTAMPTZ;
 BEGIN
-  SELECT el.lease_token, el.status, el.lease_expires_at
+  -- Read parent event reference from action
+  SELECT event_id INTO v_event_id
+  FROM public.webhook_action_ledger
+  WHERE id = p_action_id;
+
+  IF NOT FOUND OR v_event_id IS NULL THEN
+    result := FALSE;
+    RETURN;
+  END IF;
+
+  -- 1. Lock parent event row FIRST
+  SELECT lease_token, status, lease_expires_at
   INTO v_event_lease, v_event_status, v_event_lease_expires
-  FROM public.webhook_action_ledger al
-  JOIN public.webhook_event_ledger el ON el.id = al.event_id
-  WHERE al.id = p_action_id
-  FOR UPDATE OF el;
+  FROM public.webhook_event_ledger
+  WHERE id = v_event_id
+  FOR UPDATE;
 
   IF NOT FOUND THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
 
   IF v_event_status <> 'claimed' THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
   IF v_event_lease IS DISTINCT FROM p_event_lease_token THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
-  IF v_event_lease_expires IS NOT NULL AND v_event.lease_expires_at <= v_now THEN
-    RETURN FALSE;
+
+  -- 2. Lock child action row SECOND
+  SELECT lease_expires_at
+  INTO v_action_lease_expires
+  FROM public.webhook_action_ledger
+  WHERE id = p_action_id AND event_id = v_event_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    result := FALSE;
+    RETURN;
+  END IF;
+
+  -- 3. Refresh clock timestamp after acquiring row locks
+  v_now := clock_timestamp();
+
+  IF v_event_lease_expires IS NOT NULL AND v_event_lease_expires <= v_now THEN
+    result := FALSE;
+    RETURN;
+  END IF;
+  IF v_action_lease_expires IS NOT NULL AND v_action_lease_expires <= v_now THEN
+    result := FALSE;
+    RETURN;
   END IF;
 
   UPDATE public.webhook_action_ledger
@@ -932,14 +1161,20 @@ BEGIN
     AND lease_token = p_action_lease_token
     AND status = 'processing';
 
-  RETURN FOUND;
+  result := FOUND;
+  RETURN;
 END;
 $$;
 
 -- ---------------------------------------------------------------------------
 -- RPC: fn_webhook_transition_event
--- Revokes target 'claimed'. Completion requires sealed plan + all actions complete.
+-- Rejects target 'claimed'. Completion requires sealed plan + all actions complete.
 -- Exponential backoff with declared parameters.
+--
+-- Locking/clock discipline (Corrections D & F):
+-- Lock the event row, then refresh clock_timestamp() before any lease/expiry
+-- validation. attempt_count is NOT incremented on transitions (only on genuine
+-- lease acquisition in fn_webhook_claim_event).
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.fn_webhook_transition_event(
   p_event_id UUID,
@@ -959,7 +1194,8 @@ DECLARE
   v_incomplete_actions INTEGER;
   v_unknown_or_permanent INTEGER;
   v_next_retry TIMESTAMPTZ;
-  v_now TIMESTAMPTZ := clock_timestamp();
+  v_action_lease_expires TIMESTAMPTZ;
+  v_now TIMESTAMPTZ;
 BEGIN
   SELECT *
   INTO v_event
@@ -968,28 +1204,37 @@ BEGIN
   FOR UPDATE;
 
   IF NOT FOUND THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
 
+  -- Refresh clock after acquiring the row lock (D).
+  v_now := clock_timestamp();
+
   IF v_event.lease_token IS DISTINCT FROM p_lease_token THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
 
   IF v_event.lease_expires_at IS NOT NULL AND v_event.lease_expires_at <= v_now THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
 
   IF p_target_status = 'claimed' THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
 
   IF p_target_status NOT IN ('completed','released','manual_review','dead_letter') THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
 
   IF p_target_status = 'completed' THEN
     IF NOT v_event.action_plan_sealed THEN
-      RETURN FALSE;
+      result := FALSE;
+      RETURN;
     END IF;
 
     SELECT COUNT(*) INTO v_incomplete_actions
@@ -997,7 +1242,8 @@ BEGIN
     WHERE event_id = p_event_id AND status NOT IN ('completed');
 
     IF v_incomplete_actions > 0 THEN
-      RETURN FALSE;
+      result := FALSE;
+      RETURN;
     END IF;
   END IF;
 
@@ -1012,7 +1258,8 @@ BEGIN
   END IF;
 
   IF p_backoff_base_seconds <= 0 OR p_backoff_cap_seconds <= 0 OR p_backoff_cap_seconds < p_backoff_base_seconds THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
 
   IF p_target_status = 'released' AND p_backoff_base_seconds > 0 THEN
@@ -1029,7 +1276,6 @@ BEGIN
 
   UPDATE public.webhook_event_ledger
   SET status = p_target_status,
-      attempt_count = v_event.attempt_count + 1,
       lease_token = NULL,
       lease_expires_at = NULL,
       error_category = p_error_category,
@@ -1039,7 +1285,8 @@ BEGIN
       updated_at = v_now
   WHERE id = p_event_id AND lease_token = p_lease_token;
 
-  RETURN FOUND;
+  result := FOUND;
+    RETURN;
 END;
 $$;
 
@@ -1047,6 +1294,9 @@ $$;
 -- RPC: fn_webhook_transition_to_manual_review
 -- Terminal-ish state for events with unknown/permanently_failed actions.
 -- Excluded from automatic retries.
+--
+-- Locking/clock discipline (Correction D): lock the event row, then refresh
+-- clock_timestamp() before validating the lease.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.fn_webhook_transition_to_manual_review(
   p_event_id UUID,
@@ -1060,7 +1310,7 @@ SET search_path = 'public, pg_temp'
 AS $$
 DECLARE
   v_event public.webhook_event_ledger%ROWTYPE;
-  v_now TIMESTAMPTZ := clock_timestamp();
+  v_now TIMESTAMPTZ;
 BEGIN
   SELECT *
   INTO v_event
@@ -1071,6 +1321,9 @@ BEGIN
   IF NOT FOUND OR v_event.lease_token IS DISTINCT FROM p_lease_token THEN
     RETURN FALSE;
   END IF;
+
+  -- Refresh clock after acquiring the row lock (D).
+  v_now := clock_timestamp();
 
   IF v_event.lease_expires_at IS NOT NULL AND v_event.lease_expires_at <= v_now THEN
     RETURN FALSE;
@@ -1089,6 +1342,9 @@ $$;
 -- ---------------------------------------------------------------------------
 -- RPC: fn_webhook_renew_event_lease
 -- Extend event lease.
+--
+-- Locking/clock discipline (Correction D): lock the event row, refresh the
+-- clock after acquiring the lock, validate the parent lease, then mutate.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.fn_webhook_renew_event_lease(
   p_event_id UUID,
@@ -1099,26 +1355,64 @@ CREATE OR REPLACE FUNCTION public.fn_webhook_renew_event_lease(
 LANGUAGE plpgsql
 SET search_path = 'public, pg_temp'
 AS $$
+DECLARE
+  v_event_lease UUID;
+  v_event_status TEXT;
+  v_event_lease_expires TIMESTAMPTZ;
+  v_now TIMESTAMPTZ;
 BEGIN
   IF p_lease_ttl_seconds <= 0 OR p_lease_ttl_seconds > 86400 THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
+  END IF;
+
+  -- Lock the event row FIRST.
+  SELECT lease_token, status, lease_expires_at
+  INTO v_event_lease, v_event_status, v_event_lease_expires
+  FROM public.webhook_event_ledger
+  WHERE id = p_event_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    result := FALSE;
+    RETURN;
+  END IF;
+
+  IF v_event_status <> 'claimed' THEN
+    result := FALSE;
+    RETURN;
+  END IF;
+  IF v_event_lease IS DISTINCT FROM p_lease_token THEN
+    result := FALSE;
+    RETURN;
+  END IF;
+
+  -- Refresh clock after acquiring the row lock (D).
+  v_now := clock_timestamp();
+
+  IF v_event_lease_expires IS NOT NULL AND v_event_lease_expires <= v_now THEN
+    result := FALSE;
+    RETURN;
   END IF;
 
   UPDATE public.webhook_event_ledger
-  SET lease_expires_at = clock_timestamp() + (p_lease_ttl_seconds || ' seconds')::interval,
-      updated_at = clock_timestamp()
+  SET lease_expires_at = v_now + (p_lease_ttl_seconds || ' seconds')::interval,
+      updated_at = v_now
   WHERE id = p_event_id
     AND lease_token = p_lease_token
     AND status = 'claimed'
-    AND lease_expires_at > clock_timestamp();
+    AND lease_expires_at > v_now;
 
-  RETURN FOUND;
+  result := FOUND;
+  RETURN;
 END;
 $$;
 
 -- ---------------------------------------------------------------------------
 -- RPC: fn_webhook_renew_action_lease
 -- Extend action lease.
+-- Parent-first lock: event row first, then action row; clock refreshed after
+-- both locks are held (Correction D).
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.fn_webhook_renew_action_lease(
   p_action_id UUID,
@@ -1131,43 +1425,82 @@ LANGUAGE plpgsql
 SET search_path = 'public, pg_temp'
 AS $$
 DECLARE
+  v_event_id UUID;
   v_event_lease UUID;
   v_event_status TEXT;
   v_event_lease_expires TIMESTAMPTZ;
+  v_action_lease_expires TIMESTAMPTZ;
+  v_now TIMESTAMPTZ := clock_timestamp();
 BEGIN
   IF p_lease_ttl_seconds <= 0 OR p_lease_ttl_seconds > 86400 THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
 
-  SELECT el.lease_token, el.status, el.lease_expires_at
+  -- Read parent event reference from action
+  SELECT event_id INTO v_event_id
+  FROM public.webhook_action_ledger
+  WHERE id = p_action_id;
+
+  IF NOT FOUND OR v_event_id IS NULL THEN
+    result := FALSE;
+    RETURN;
+  END IF;
+
+  -- 1. Lock parent event row FIRST
+  SELECT lease_token, status, lease_expires_at
   INTO v_event_lease, v_event_status, v_event_lease_expires
-  FROM public.webhook_action_ledger al
-  JOIN public.webhook_event_ledger el ON el.id = al.event_id
-  WHERE al.id = p_action_id
-  FOR UPDATE OF el;
+  FROM public.webhook_event_ledger
+  WHERE id = v_event_id
+  FOR UPDATE;
 
   IF NOT FOUND THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
 
   IF v_event_status <> 'claimed' THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
   IF v_event_lease IS DISTINCT FROM p_event_lease_token THEN
-    RETURN FALSE;
+    result := FALSE;
+    RETURN;
   END IF;
-  IF v_event_lease_expires IS NOT NULL AND v_event.lease_expires_at <= clock_timestamp() THEN
-    RETURN FALSE;
+
+  -- 2. Lock child action row SECOND
+  SELECT lease_expires_at
+  INTO v_action_lease_expires
+  FROM public.webhook_action_ledger
+  WHERE id = p_action_id AND event_id = v_event_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    result := FALSE;
+    RETURN;
+  END IF;
+
+  -- 3. Refresh clock timestamp after acquiring row locks
+  v_now := clock_timestamp();
+
+  IF v_event_lease_expires IS NOT NULL AND v_event_lease_expires <= v_now THEN
+    result := FALSE;
+    RETURN;
+  END IF;
+  IF v_action_lease_expires IS NOT NULL AND v_action_lease_expires <= v_now THEN
+    result := FALSE;
+    RETURN;
   END IF;
 
   UPDATE public.webhook_action_ledger
-  SET lease_expires_at = clock_timestamp() + (p_lease_ttl_seconds || ' seconds')::interval,
-      updated_at = clock_timestamp()
+  SET lease_expires_at = v_now + (p_lease_ttl_seconds || ' seconds')::interval,
+      updated_at = v_now
   WHERE id = p_action_id
     AND lease_token = p_action_lease_token
     AND status = 'processing';
 
-  RETURN FOUND;
+  result := FOUND;
+  RETURN;
 END;
 $$;
 
@@ -1177,7 +1510,17 @@ $$;
 -- Expired external side-effect actions -> unknown (never auto-resend).
 -- Expired internal actions -> retryable (idempotent).
 -- Parents with unknown external actions -> manual_review.
--- SKIP LOCKED for concurrency safety.
+-- SKIP LOCKED for concurrency safety. Parent-first lock hierarchy.
+--
+-- Locking/clock discipline (Corrections D & E):
+-- - Recovery work respects the configured batch size.
+-- - Only expired records are recovered.
+-- - Parent rows are locked before child rows; no child-only FOR UPDATE OF
+--   SKIP LOCKED path violates the hierarchy.
+-- - clock_timestamp() is refreshed after each lock acquisition.
+-- - attempt_count is NOT incremented by recovery (F).
+-- - Unknown side-effect actions block event reclaim and drive manual_review.
+-- - Never automatically clear or retry ambiguous external sends.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.fn_webhook_recover_expired_leases(
   p_batch_size INTEGER DEFAULT 100,
@@ -1192,9 +1535,13 @@ DECLARE
   v_event_recoveries INTEGER := 0;
   v_action_recoveries INTEGER := 0;
   v_action_unknown_count INTEGER := 0;
+  v_now TIMESTAMPTZ := clock_timestamp();
   v_event_rec RECORD;
   v_action_rec RECORD;
-  v_now TIMESTAMPTZ := clock_timestamp();
+  v_parent_id UUID;
+  v_parent_status TEXT;
+  v_have_unknown_child BOOLEAN;
+  v_created_unknown BOOLEAN;
 BEGIN
   IF p_batch_size <= 0 OR p_batch_size > 1000 THEN
     event_recoveries := 0;
@@ -1203,8 +1550,12 @@ BEGIN
     RETURN;
   END IF;
 
+  -- ------------------------------------------------------------------
+  -- Phase A: Expired events (parents first). Lock each event row, then
+  -- recover that event's own expired child actions under the parent lock.
+  -- ------------------------------------------------------------------
   FOR v_event_rec IN
-    SELECT id, attempt_count, max_attempts
+    SELECT id, attempt_count, max_attempts, lease_expires_at
     FROM public.webhook_event_ledger
     WHERE status = 'claimed'
       AND lease_expires_at IS NOT NULL
@@ -1213,47 +1564,163 @@ BEGIN
     LIMIT p_batch_size
     FOR UPDATE SKIP LOCKED
   LOOP
-    IF v_event_rec.attempt_count >= v_event_rec.max_attempts THEN
+    -- Refresh clock after acquiring the event row lock (D).
+    v_now := clock_timestamp();
+
+    -- Re-verify the row is still an expired, claimed event under the lock.
+    IF v_event_rec.lease_expires_at IS NULL OR v_event_rec.lease_expires_at > v_now THEN
+      CONTINUE;
+    END IF;
+
+    -- E #8: an expired event with an unknown external side-effect child must
+    -- enter manual_review, including when first encountered by recovery.
+    SELECT EXISTS (
+      SELECT 1
+      FROM public.webhook_action_ledger
+      WHERE event_id = v_event_rec.id
+        AND side_effect = TRUE
+        AND status = 'unknown'
+    ) INTO v_have_unknown_child;
+
+    IF v_have_unknown_child THEN
       UPDATE public.webhook_event_ledger
-      SET status = 'dead_letter', lease_token = NULL, lease_expires_at = NULL, updated_at = v_now
+      SET status = 'manual_review',
+          lease_token = NULL,
+          lease_expires_at = NULL,
+          error_category = 'unknown',
+          updated_at = v_now
+      WHERE id = v_event_rec.id;
+      v_event_recoveries := v_event_recoveries + 1;
+      CONTINUE;
+    END IF;
+
+    -- Recover this event's expired processing actions. Parent is already
+    -- locked (parent-first hierarchy); lock each child under it.
+    v_created_unknown := FALSE;
+    FOR v_action_rec IN
+      SELECT id, side_effect, attempt_count, max_attempts
+      FROM public.webhook_action_ledger
+      WHERE event_id = v_event_rec.id
+        AND status = 'processing'
+        AND lease_expires_at IS NOT NULL
+        AND lease_expires_at <= v_now
+      ORDER BY lease_expires_at ASC
+      FOR UPDATE SKIP LOCKED
+    LOOP
+      v_now := clock_timestamp();
+      IF v_action_rec.side_effect THEN
+        -- E #4: ambiguous external side-effect -> unknown, never auto-resend.
+        UPDATE public.webhook_action_ledger
+        SET status = 'unknown',
+            lease_token = NULL,
+            lease_expires_at = NULL,
+            updated_at = v_now
+        WHERE id = v_action_rec.id;
+        v_action_unknown_count := v_action_unknown_count + 1;
+        v_created_unknown := TRUE;
+      ELSE
+        -- E #3: only known-safe non-side-effect actions may be made retryable.
+        -- F: recovery alone does NOT increment attempt_count.
+        UPDATE public.webhook_action_ledger
+        SET status = 'retryable',
+            lease_token = NULL,
+            lease_expires_at = NULL,
+            retry_at = v_now +
+              (LEAST(60 * (2 ^ (GREATEST(1, v_action_rec.attempt_count - 1))), 3600) || ' seconds')::interval,
+            updated_at = v_now
+        WHERE id = v_action_rec.id;
+        v_action_recoveries := v_action_recoveries + 1;
+      END IF;
+    END LOOP;
+
+    -- E #8 / E #10: if recovery created an unknown side-effect action, the
+    -- event enters manual_review; never automatically retry ambiguous sends.
+    IF v_created_unknown THEN
+      UPDATE public.webhook_event_ledger
+      SET status = 'manual_review',
+          lease_token = NULL,
+          lease_expires_at = NULL,
+          error_category = 'unknown',
+          updated_at = v_now
+      WHERE id = v_event_rec.id;
+    ELSIF v_event_rec.attempt_count >= v_event_rec.max_attempts THEN
+      UPDATE public.webhook_event_ledger
+      SET status = 'dead_letter',
+          lease_token = NULL,
+          lease_expires_at = NULL,
+          updated_at = v_now
       WHERE id = v_event_rec.id;
     ELSE
+      -- Release the event (schedulable) WITHOUT incrementing attempt_count (F).
       UPDATE public.webhook_event_ledger
       SET status = 'released',
-          attempt_count = v_event_rec.attempt_count + 1,
           lease_token = NULL,
           lease_expires_at = NULL,
           retry_at = v_now +
-            (LEAST(60 * (2 ^ (v_event_rec.attempt_count - 1)), 3600) || ' seconds')::interval,
+            (LEAST(60 * (2 ^ (GREATEST(1, v_event_rec.attempt_count - 1))), 3600) || ' seconds')::interval,
           updated_at = v_now
       WHERE id = v_event_rec.id;
     END IF;
     v_event_recoveries := v_event_recoveries + 1;
   END LOOP;
 
+  -- ------------------------------------------------------------------
+  -- Phase B: Expired processing actions whose parent event was not handled
+  -- in Phase A (e.g. parent already released/manual_review/dead_letter, or a
+  -- claimed-but-not-expired parent). Parent-first: lock parent first, then
+  -- child. SKIP LOCKED so the reaper never blocks on a held lock (E #6).
+  -- ------------------------------------------------------------------
   FOR v_action_rec IN
-    SELECT al.id, al.event_id, al.status, al.lease_expires_at,
-           al.attempt_count, al.max_attempts, al.side_effect
+    SELECT al.id, al.event_id, al.side_effect, al.attempt_count, al.max_attempts
     FROM public.webhook_action_ledger al
-    JOIN public.webhook_event_ledger el ON el.id = al.event_id
     WHERE al.status = 'processing'
       AND al.lease_expires_at IS NOT NULL
       AND al.lease_expires_at <= v_now
-      AND el.status IN ('claimed','released')
     ORDER BY al.lease_expires_at ASC
     LIMIT p_batch_size
-    FOR UPDATE SKIP LOCKED
   LOOP
+    -- Lock parent event row FIRST (E #5). SKIP LOCKED: skip events held by
+    -- an active worker rather than waiting.
+    SELECT id, status
+    INTO v_parent_id, v_parent_status
+    FROM public.webhook_event_ledger
+    WHERE id = v_action_rec.event_id
+    FOR UPDATE SKIP LOCKED;
+
+    IF NOT FOUND THEN
+      CONTINUE;
+    END IF;
+
+    -- Re-read the child under the parent lock; only act if it is still an
+    -- expired processing action (it may have been resolved by Phase A).
+    SELECT id, side_effect, attempt_count, max_attempts
+    INTO v_action_rec.id, v_action_rec.side_effect, v_action_rec.attempt_count, v_action_rec.max_attempts
+    FROM public.webhook_action_ledger
+    WHERE id = v_action_rec.id
+      AND status = 'processing'
+      AND lease_expires_at IS NOT NULL
+      AND lease_expires_at <= v_now
+    FOR UPDATE SKIP LOCKED;
+
+    IF NOT FOUND THEN
+      CONTINUE;
+    END IF;
+
+    v_now := clock_timestamp();
+
     IF v_action_rec.side_effect THEN
       UPDATE public.webhook_action_ledger
-      SET status = 'unknown', lease_token = NULL, lease_expires_at = NULL,
+      SET status = 'unknown',
+          lease_token = NULL,
+          lease_expires_at = NULL,
           updated_at = v_now
       WHERE id = v_action_rec.id;
       v_action_unknown_count := v_action_unknown_count + 1;
     ELSE
       UPDATE public.webhook_action_ledger
-      SET status = 'retryable', lease_token = NULL, lease_expires_at = NULL,
-          attempt_count = v_action_rec.attempt_count,
+      SET status = 'retryable',
+          lease_token = NULL,
+          lease_expires_at = NULL,
           retry_at = v_now +
             (LEAST(60 * (2 ^ (GREATEST(1, v_action_rec.attempt_count - 1))), 3600) || ' seconds')::interval,
           updated_at = v_now
@@ -1262,17 +1729,17 @@ BEGIN
     END IF;
   END LOOP;
 
-  UPDATE public.webhook_action_ledger al
-  SET status = 'retryable', lease_token = NULL, lease_expires_at = NULL,
-      updated_at = v_now
-  FROM public.webhook_event_ledger el
-  WHERE al.event_id = el.id
-    AND al.status = 'processing'
-    AND el.status NOT IN ('claimed');
-
+  -- ------------------------------------------------------------------
+  -- Final: any claimed event that now has an unknown external side-effect
+  -- child enters manual_review. Unknown side-effect actions block reclaim.
+  -- Repeated execution preserves unknown/manual_review states (E #7, E #9).
+  -- ------------------------------------------------------------------
   UPDATE public.webhook_event_ledger el
-  SET status = 'manual_review', lease_token = NULL, lease_expires_at = NULL,
-      error_category = 'unknown', updated_at = v_now
+  SET status = 'manual_review',
+      lease_token = NULL,
+      lease_expires_at = NULL,
+      error_category = 'unknown',
+      updated_at = v_now
   FROM public.webhook_action_ledger al
   WHERE al.event_id = el.id
     AND el.status = 'claimed'

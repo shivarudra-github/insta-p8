@@ -2,11 +2,11 @@
 // Used strictly by test runner to verify database ownership filtering in route handlers
 
 export interface MockStore {
-  automations: Array<{ id: string; user_id: string; [key: string]: any }>
-  conversations: Array<{ id: string; user_id: string; recipient_id: string; [key: string]: any }>
-  messages: Array<{ id: string; conversation_id: string; user_id: string; [key: string]: any }>
-  users: Array<{ id: string; access_token?: string; username?: string; [key: string]: any }>
-  ice_breakers: Array<{ id: string; user_id: string; [key: string]: any }>
+  automations: Array<{ id: string; user_id: string;[key: string]: any }>
+  conversations: Array<{ id: string; user_id: string; recipient_id: string;[key: string]: any }>
+  messages: Array<{ id: string; conversation_id: string; user_id: string;[key: string]: any }>
+  users: Array<{ id: string; access_token?: string; username?: string;[key: string]: any }>
+  ice_breakers: Array<{ id: string; user_id: string;[key: string]: any }>
   webhook_events: Array<{ id: string; event_type: string; user_id?: any; data?: any; processed_at?: string }>
   webhook_event_ledger: Array<{ id: string; event_key: string; event_type: string; user_id: any; status: string; attempt_count: number; max_attempts: number; retry_at?: string; lease_token?: string | null; lease_expires_at?: string | null; error_category?: string; error_code?: string; action_plan_sealed: boolean; data?: any; created_at?: string; updated_at?: string; completed_at?: string }>
   webhook_action_ledger: Array<{ id: string; event_id: string; action_key: string; action_type: string; status: string; attempt_count: number; max_attempts: number; retry_at?: string; lease_token?: string | null; lease_expires_at?: string | null; error_category?: string; error_code?: string; provider_message_id?: string; provider_status?: string; provider_payload_hash?: string; side_effect: boolean; created_at?: string; updated_at?: string; completed_at?: string }>
@@ -31,6 +31,7 @@ export interface MockStore {
   throwNextUserSelect?: boolean
   rpcResults: Map<string, any>
   rpcErrors: Map<string, any>
+  enforceRetryBackoff?: boolean
 }
 
 export const mockStore: MockStore = {
@@ -45,6 +46,7 @@ export const mockStore: MockStore = {
   queries: [],
   rpcResults: new Map(),
   rpcErrors: new Map(),
+  enforceRetryBackoff: false,
 }
 
 export function resetMockStore() {
@@ -69,6 +71,7 @@ export function resetMockStore() {
   mockStore.throwNextUserSelect = false
   mockStore.rpcResults = new Map()
   mockStore.rpcErrors = new Map()
+  mockStore.enforceRetryBackoff = false
 }
 
 class QueryBuilder {
@@ -279,7 +282,7 @@ class QueryBuilder {
         const remaining = ((mockStore as any)[this.table] || []).filter(
           (r: any) => !rows.some((del) => del.id === r.id)
         )
-        ;(mockStore as any)[this.table] = remaining
+          ; (mockStore as any)[this.table] = remaining
         throw new Error("Network connection dropped after DELETE applied")
       }
       if (mockStore.failNextDelete) {
@@ -293,7 +296,7 @@ class QueryBuilder {
       const remaining = ((mockStore as any)[this.table] || []).filter(
         (r: any) => !rows.some((del) => del.id === r.id)
       )
-      ;(mockStore as any)[this.table] = remaining
+        ; (mockStore as any)[this.table] = remaining
       return { data: null, error: null, count: rows.length }
     }
 
@@ -361,216 +364,236 @@ export async function getSupabaseServerClient() {
           if (existing.status === "claimed" && existing.lease_expires_at && new Date(existing.lease_expires_at) > new Date()) {
             return { data: { outcome: "active_lease", event_id: existing.id, lease_token: null, lease_expires_at: null }, error: null }
           }
-          if (existing.status === "released" && existing.retry_at && new Date(existing.retry_at) > new Date()) {
-            return { data: { outcome: "retry_not_due", event_id: existing.id, lease_token: null, lease_expires_at: null }, error: null }
+            if (existing.status === "released" && mockStore.enforceRetryBackoff && existing.retry_at && new Date(existing.retry_at) > new Date()) {
+              return { data: { outcome: "retry_not_due", event_id: existing.id, lease_token: null, lease_expires_at: null }, error: null }
+            }
+            // Reclaim expired lease
+            existing.status = "claimed"
+            existing.attempt_count = (existing.attempt_count || 0) + 1
+            existing.lease_token = `evt_lease_${Date.now()}`
+            existing.lease_expires_at = new Date(Date.now() + (p_lease_ttl_seconds || 300) * 1000).toISOString()
+            existing.updated_at = new Date().toISOString()
+            if (!mockStore.webhook_events.some((e) => e.id === existing.id)) {
+              mockStore.webhook_events.push({
+                id: existing.id,
+                event_type: existing.event_type,
+                user_id: existing.user_id,
+                data: existing.data,
+                processed_at: existing.created_at,
+              })
+            }
+            return { data: { outcome: "reclaimed", event_id: existing.id, lease_token: existing.lease_token, lease_expires_at: existing.lease_expires_at }, error: null }
           }
-          // Reclaim expired lease
-          existing.status = "claimed"
-          existing.attempt_count = (existing.attempt_count || 0) + 1
-          existing.lease_token = `evt_lease_${Date.now()}`
-          existing.lease_expires_at = new Date(Date.now() + (p_lease_ttl_seconds || 300) * 1000).toISOString()
-          existing.updated_at = new Date().toISOString()
-          return { data: { outcome: "reclaimed", event_id: existing.id, lease_token: existing.lease_token, lease_expires_at: existing.lease_expires_at }, error: null }
-        }
-        // Insert new event
-        const newEvent = {
-          id: `evt_${Date.now()}`,
-          event_key: p_event_key,
-          event_type: p_event_type,
-          user_id: p_user_id,
-          data: p_data,
-          status: "claimed",
-          attempt_count: 1,
-          max_attempts: 5,
-          lease_token: `evt_lease_${Date.now()}`,
-          lease_expires_at: new Date(Date.now() + (p_lease_ttl_seconds || 300) * 1000).toISOString(),
-          action_plan_sealed: false,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        }
-        mockStore.webhook_event_ledger.push(newEvent)
-        return { data: { outcome: "created", event_id: newEvent.id, lease_token: newEvent.lease_token, lease_expires_at: newEvent.lease_expires_at }, error: null }
-      }
-
-      // --- fn_webhook_register_action_plan ---
-      if (fnName === "fn_webhook_register_action_plan") {
-        const { p_event_id, p_actions } = params as any
-        const event = mockStore.webhook_event_ledger.find((r) => r.id === p_event_id)
-        if (!event) return { data: { outcome: "event_not_found", plan_sealed: false, action_count: 0 }, error: null }
-        if (event.action_plan_sealed) return { data: { outcome: "plan_sealed", plan_sealed: true, action_count: 0 }, error: null }
-
-        const actions = p_actions || []
-        for (const a of actions) {
-          mockStore.webhook_action_ledger.push({
-            id: `act_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-            event_id: p_event_id,
-            action_key: a.action_key,
-            action_type: a.action_type,
-            status: "pending",
-            attempt_count: 0,
-            max_attempts: 3,
-            side_effect: a.side_effect,
+          // Insert new event
+          const newEvent = {
+            id: `evt_${Date.now()}`,
+            event_key: p_event_key,
+            event_type: p_event_type,
+            user_id: p_user_id,
+            data: p_data,
+            status: "claimed",
+            attempt_count: 1,
+            max_attempts: 5,
+            lease_token: `evt_lease_${Date.now()}`,
+            lease_expires_at: new Date(Date.now() + (p_lease_ttl_seconds || 300) * 1000).toISOString(),
+            action_plan_sealed: false,
             created_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
+          }
+          mockStore.webhook_event_ledger.push(newEvent)
+          mockStore.webhook_events.push({
+            id: newEvent.id,
+            event_type: p_event_type,
+            user_id: p_user_id,
+            data: p_data,
+            processed_at: newEvent.created_at,
           })
+          return { data: { outcome: "created", event_id: newEvent.id, lease_token: newEvent.lease_token, lease_expires_at: newEvent.lease_expires_at }, error: null }
         }
-        event.action_plan_sealed = true
-        event.updated_at = new Date().toISOString()
-        const count = mockStore.webhook_action_ledger.filter((a) => a.event_id === p_event_id).length
-        return { data: { outcome: "plan_registered", plan_sealed: true, action_count: count }, error: null }
-      }
 
-      // --- fn_webhook_claim_action ---
-      if (fnName === "fn_webhook_claim_action") {
-        const { p_event_id, p_action_key } = params as any
-        const action = mockStore.webhook_action_ledger.find((a) => a.event_id === p_event_id && a.action_key === p_action_key)
-        if (!action) return { data: { outcome: "action_not_registered", action_id: null, lease_token: null, lease_expires_at: null }, error: null }
-        if (action.status === "unknown" || action.status === "permanently_failed") {
-          return { data: { outcome: "action_terminal", action_id: action.id, lease_token: null, lease_expires_at: null }, error: null }
+        // --- fn_webhook_register_action_plan ---
+      else if (fnName === "fn_webhook_register_action_plan") {
+          const { p_event_id, p_actions } = params as any
+          const event = mockStore.webhook_event_ledger.find((r) => r.id === p_event_id)
+          if (!event) return { data: { outcome: "event_not_found", plan_sealed: false, action_count: 0 }, error: null }
+          if (event.action_plan_sealed) return { data: { outcome: "plan_sealed", plan_sealed: true, action_count: 0 }, error: null }
+
+          const actions = p_actions || []
+          for (const a of actions) {
+            mockStore.webhook_action_ledger.push({
+              id: `act_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+              event_id: p_event_id,
+              action_key: a.action_key,
+              action_type: a.action_type,
+              status: "pending",
+              attempt_count: 0,
+              max_attempts: 3,
+              side_effect: a.side_effect,
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            })
+          }
+          event.action_plan_sealed = true
+          event.updated_at = new Date().toISOString()
+          const count = mockStore.webhook_action_ledger.filter((a) => a.event_id === p_event_id).length
+          return { data: { outcome: "plan_registered", plan_sealed: true, action_count: count }, error: null }
         }
-        if (action.status === "completed") {
-          return { data: { outcome: "action_completed", action_id: action.id, lease_token: null, lease_expires_at: null }, error: null }
-        }
-        if (action.status === "processing" && action.lease_expires_at && new Date(action.lease_expires_at) > new Date()) {
-          return { data: { outcome: "action_active_lease", action_id: action.id, lease_token: null, lease_expires_at: null }, error: null }
-        }
-        if (action.status === "retryable" && action.retry_at && new Date(action.retry_at) > new Date()) {
-          return { data: { outcome: "retry_not_due", action_id: action.id, lease_token: null, lease_expires_at: null }, error: null }
-        }
-        if (action.status === "processing" && action.lease_expires_at && new Date(action.lease_expires_at) <= new Date() && action.side_effect) {
-          action.status = "unknown"
-          action.lease_token = null
-          action.lease_expires_at = null
-          action.attempt_count = (action.attempt_count || 0) + 1
-          action.updated_at = new Date().toISOString()
-          return { data: { outcome: "action_expired_unknown", action_id: action.id, lease_token: null, lease_expires_at: null }, error: null }
-        }
-        action.status = "processing"
-        action.attempt_count = (action.attempt_count || 0) + 1
-        action.lease_token = `act_lease_${Date.now()}`
-        action.lease_expires_at = new Date(Date.now() + 300000).toISOString()
-        action.updated_at = new Date().toISOString()
-        return { data: { outcome: "claimed", action_id: action.id, lease_token: action.lease_token, lease_expires_at: action.lease_expires_at }, error: null }
-      }
 
-      // --- fn_webhook_mark_action_complete ---
-      if (fnName === "fn_webhook_mark_action_complete") {
-        const { p_action_id } = params as any
-        const action = mockStore.webhook_action_ledger.find((a) => a.id === p_action_id)
-        if (!action || action.status !== "processing") return { data: false, error: null }
-        action.status = "completed"
-        action.lease_token = null
-        action.lease_expires_at = null
-        action.completed_at = new Date().toISOString()
-        action.updated_at = new Date().toISOString()
-        if (params.p_provider_message_id) action.provider_message_id = params.p_provider_message_id
-        if (params.p_provider_status) action.provider_status = params.p_provider_status
-        return { data: true, error: null }
-      }
+        // --- fn_webhook_claim_action ---
+      else if (fnName === "fn_webhook_claim_action") {
+          const { p_event_id, p_action_key } = params as any
+          const action = mockStore.webhook_action_ledger.find((a) => a.event_id === p_event_id && a.action_key === p_action_key)
+          if (!action) return { data: { outcome: "action_not_registered", action_id: null, lease_token: null, lease_expires_at: null }, error: null }
+          if (action.status === "unknown" || action.status === "permanently_failed") {
+            return { data: { outcome: "action_terminal", action_id: action.id, lease_token: null, lease_expires_at: null }, error: null }
+          }
+          if (action.status === "completed") {
+            return { data: { outcome: "action_completed", action_id: action.id, lease_token: null, lease_expires_at: null }, error: null }
+          }
+          if (action.status === "processing" && action.lease_expires_at && new Date(action.lease_expires_at) > new Date()) {
+            return { data: { outcome: "action_active_lease", action_id: action.id, lease_token: null, lease_expires_at: null }, error: null }
+          }
+            if (action.status === "retryable" && mockStore.enforceRetryBackoff && action.retry_at && new Date(action.retry_at) > new Date()) {
+              return { data: { outcome: "retry_not_due", action_id: action.id, lease_token: null, lease_expires_at: null }, error: null }
+            }
+            if (action.status === "processing" && action.lease_expires_at && new Date(action.lease_expires_at) <= new Date() && action.side_effect) {
+              action.status = "unknown"
+              action.lease_token = null
+              action.lease_expires_at = null
+              action.attempt_count = (action.attempt_count || 0) + 1
+              action.updated_at = new Date().toISOString()
+              return { data: { outcome: "action_expired_unknown", action_id: action.id, lease_token: null, lease_expires_at: null }, error: null }
+            }
+            action.status = "processing"
+            action.attempt_count = (action.attempt_count || 0) + 1
+            action.lease_token = `act_lease_${Date.now()}`
+            action.lease_expires_at = new Date(Date.now() + 300000).toISOString()
+            action.updated_at = new Date().toISOString()
+            return { data: { outcome: "claimed", action_id: action.id, lease_token: action.lease_token, lease_expires_at: action.lease_expires_at }, error: null }
+          }
 
-      // --- fn_webhook_mark_action_retryable ---
-      if (fnName === "fn_webhook_mark_action_retryable") {
-        const { p_action_id, p_backoff_base_seconds = 60, p_backoff_cap_seconds = 3600 } = params as any
-        const action = mockStore.webhook_action_ledger.find((a) => a.id === p_action_id)
-        if (!action || action.status !== "processing") return { data: false, error: null }
-        if ((action.attempt_count || 0) >= (action.max_attempts || 3)) {
-          action.status = "permanently_failed"
-          action.lease_token = null
-          action.lease_expires_at = null
-          action.updated_at = new Date().toISOString()
-          return { data: true, error: null }
-        }
-        action.status = "retryable"
-        action.lease_token = null
-        action.lease_expires_at = null
-        action.retry_at = new Date(Date.now() + Math.min(p_backoff_base_seconds * Math.pow(2, (action.attempt_count || 0) - 1), p_backoff_cap_seconds) * 1000).toISOString()
-        action.updated_at = new Date().toISOString()
-        return { data: true, error: null }
-      }
+          // --- fn_webhook_mark_action_complete ---
+      else if (fnName === "fn_webhook_mark_action_complete") {
+            const { p_action_id } = params as any
+            const action = mockStore.webhook_action_ledger.find((a) => a.id === p_action_id)
+            if (!action || action.status !== "processing") return { data: false, error: null }
+            action.status = "completed"
+            action.lease_token = null
+            action.lease_expires_at = null
+            action.completed_at = new Date().toISOString()
+            action.updated_at = new Date().toISOString()
+            if (params.p_provider_message_id) action.provider_message_id = params.p_provider_message_id
+            if (params.p_provider_status) action.provider_status = params.p_provider_status
+            return { data: true, error: null }
+          }
 
-      // --- fn_webhook_mark_action_unknown ---
-      if (fnName === "fn_webhook_mark_action_unknown") {
-        const { p_action_id } = params as any
-        const action = mockStore.webhook_action_ledger.find((a) => a.id === p_action_id)
-        if (!action || action.status !== "processing") return { data: false, error: null }
-        action.status = "unknown"
-        action.lease_token = null
-        action.lease_expires_at = null
-        action.updated_at = new Date().toISOString()
-        if (params.p_provider_status) action.provider_status = params.p_provider_status
-        return { data: true, error: null }
-      }
+          // --- fn_webhook_mark_action_retryable ---
+      else if (fnName === "fn_webhook_mark_action_retryable") {
+            const { p_action_id, p_backoff_base_seconds = 60, p_backoff_cap_seconds = 3600 } = params as any
+            const action = mockStore.webhook_action_ledger.find((a) => a.id === p_action_id)
+            if (!action || action.status !== "processing") return { data: false, error: null }
+            if ((action.attempt_count || 0) >= (action.max_attempts || 3)) {
+              action.status = "permanently_failed"
+              action.lease_token = null
+              action.lease_expires_at = null
+              action.updated_at = new Date().toISOString()
+              return { data: true, error: null }
+            }
+            action.status = "retryable"
+            action.lease_token = null
+            action.lease_expires_at = null
+            action.retry_at = new Date(Date.now() + Math.min(p_backoff_base_seconds * Math.pow(2, (action.attempt_count || 0) - 1), p_backoff_cap_seconds) * 1000).toISOString()
+            action.updated_at = new Date().toISOString()
+            return { data: true, error: null }
+          }
 
-      // --- fn_webhook_mark_action_permanently_failed ---
-      if (fnName === "fn_webhook_mark_action_permanently_failed") {
-        const { p_action_id } = params as any
-        const action = mockStore.webhook_action_ledger.find((a) => a.id === p_action_id)
-        if (!action || action.status !== "processing") return { data: false, error: null }
-        action.status = "permanently_failed"
-        action.lease_token = null
-        action.lease_expires_at = null
-        action.updated_at = new Date().toISOString()
-        return { data: true, error: null }
-      }
+          // --- fn_webhook_mark_action_unknown ---
+      else if (fnName === "fn_webhook_mark_action_unknown") {
+            const { p_action_id } = params as any
+            const action = mockStore.webhook_action_ledger.find((a) => a.id === p_action_id)
+            if (!action || action.status !== "processing") return { data: false, error: null }
+            action.status = "unknown"
+            action.lease_token = null
+            action.lease_expires_at = null
+            action.updated_at = new Date().toISOString()
+            if (params.p_provider_status) action.provider_status = params.p_provider_status
+            return { data: true, error: null }
+          }
 
-      // --- fn_webhook_transition_event ---
-      if (fnName === "fn_webhook_transition_event") {
-        const { p_event_id, p_target_status } = params as any
-        const event = mockStore.webhook_event_ledger.find((r) => r.id === p_event_id)
-        if (!event) return { data: false, error: null }
-        if (p_target_status === "completed") {
-          if (!event.action_plan_sealed) return { data: false, error: null }
-          const incomplete = mockStore.webhook_action_ledger.filter((a) => a.event_id === p_event_id && a.status !== "completed")
-          if (incomplete.length > 0) return { data: false, error: null }
-        }
-        event.status = p_target_status
-        event.attempt_count = (event.attempt_count || 0) + 1
-        event.lease_token = null
-        event.lease_expires_at = null
-        event.updated_at = new Date().toISOString()
-        if (p_target_status === "completed") event.completed_at = new Date().toISOString()
-        return { data: true, error: null }
-      }
+          // --- fn_webhook_mark_action_permanently_failed ---
+      else if (fnName === "fn_webhook_mark_action_permanently_failed") {
+            const { p_action_id } = params as any
+            const action = mockStore.webhook_action_ledger.find((a) => a.id === p_action_id)
+            if (!action || action.status !== "processing") return { data: false, error: null }
+            action.status = "permanently_failed"
+            action.lease_token = null
+            action.lease_expires_at = null
+            action.updated_at = new Date().toISOString()
+            return { data: true, error: null }
+          }
 
-      // --- fn_webhook_transition_to_manual_review ---
-      if (fnName === "fn_webhook_transition_to_manual_review") {
-        const { p_event_id } = params as any
-        const event = mockStore.webhook_event_ledger.find((r) => r.id === p_event_id)
-        if (!event) return { data: false, error: null }
-        event.status = "manual_review"
-        event.lease_token = null
-        event.lease_expires_at = null
-        event.updated_at = new Date().toISOString()
-        return { data: true, error: null }
-      }
+          // --- fn_webhook_transition_event ---
+      else if (fnName === "fn_webhook_transition_event") {
+            const { p_event_id, p_target_status } = params as any
+            const event = mockStore.webhook_event_ledger.find((r) => r.id === p_event_id)
+            if (!event) return { data: false, error: null }
+            if (p_target_status === "completed") {
+              if (!event.action_plan_sealed) return { data: false, error: null }
+              const incomplete = mockStore.webhook_action_ledger.filter((a) => a.event_id === p_event_id && a.status !== "completed")
+              if (incomplete.length > 0) return { data: false, error: null }
+            }
+            event.status = p_target_status
+            event.attempt_count = (event.attempt_count || 0) + 1
+            event.lease_token = null
+            event.lease_expires_at = null
+            event.updated_at = new Date().toISOString()
+            if (p_target_status === "completed") event.completed_at = new Date().toISOString()
+            if (p_target_status === "released") {
+              mockStore.webhook_events = mockStore.webhook_events.filter((e) => e.id !== p_event_id)
+            }
+            return { data: true, error: null }
+          }
 
-      // --- fn_webhook_renew_event_lease ---
-      if (fnName === "fn_webhook_renew_event_lease") {
-        const { p_event_id } = params as any
-        const event = mockStore.webhook_event_ledger.find((r) => r.id === p_event_id)
-        if (!event || event.status !== "claimed") return { data: false, error: null }
-        event.lease_expires_at = new Date(Date.now() + 300000).toISOString()
-        event.updated_at = new Date().toISOString()
-        return { data: true, error: null }
-      }
+          // --- fn_webhook_transition_to_manual_review ---
+      else if (fnName === "fn_webhook_transition_to_manual_review") {
+            const { p_event_id } = params as any
+            const event = mockStore.webhook_event_ledger.find((r) => r.id === p_event_id)
+            if (!event) return { data: false, error: null }
+            event.status = "manual_review"
+            event.lease_token = null
+            event.lease_expires_at = null
+            event.updated_at = new Date().toISOString()
+            mockStore.webhook_events = mockStore.webhook_events.filter((e) => e.id !== p_event_id)
+            return { data: true, error: null }
+          }
 
-      // --- fn_webhook_renew_action_lease ---
-      if (fnName === "fn_webhook_renew_action_lease") {
-        const { p_action_id } = params as any
-        const action = mockStore.webhook_action_ledger.find((a) => a.id === p_action_id)
-        if (!action || action.status !== "processing") return { data: false, error: null }
-        action.lease_expires_at = new Date(Date.now() + 300000).toISOString()
-        action.updated_at = new Date().toISOString()
-        return { data: true, error: null }
-      }
+          // --- fn_webhook_renew_event_lease ---
+      else if (fnName === "fn_webhook_renew_event_lease") {
+            const { p_event_id } = params as any
+            const event = mockStore.webhook_event_ledger.find((r) => r.id === p_event_id)
+            if (!event || event.status !== "claimed") return { data: false, error: null }
+            event.lease_expires_at = new Date(Date.now() + 300000).toISOString()
+            event.updated_at = new Date().toISOString()
+            return { data: true, error: null }
+          }
 
-      // --- fn_webhook_recover_expired_leases ---
-      if (fnName === "fn_webhook_recover_expired_leases") {
-        return { data: { event_recoveries: 0, action_recoveries: 0, action_unknown_count: 0 }, error: null }
-      }
+          // --- fn_webhook_renew_action_lease ---
+      else if (fnName === "fn_webhook_renew_action_lease") {
+            const { p_action_id } = params as any
+            const action = mockStore.webhook_action_ledger.find((a) => a.id === p_action_id)
+            if (!action || action.status !== "processing") return { data: false, error: null }
+            action.lease_expires_at = new Date(Date.now() + 300000).toISOString()
+            action.updated_at = new Date().toISOString()
+            return { data: true, error: null }
+          }
 
-      return { data: null, error: { code: "PGRST116", message: `Unknown RPC function: ${fnName}` } }
-    },
-  }
-}
+          // --- fn_webhook_recover_expired_leases ---
+      else if (fnName === "fn_webhook_recover_expired_leases") {
+            return { data: { event_recoveries: 0, action_recoveries: 0, action_unknown_count: 0 }, error: null }
+          }
+
+          return { data: null, error: { code: "PGRST116", message: `Unknown RPC function: ${fnName}` } }
+        },
+      }
+    }
 
